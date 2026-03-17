@@ -86,6 +86,7 @@ fn run(
         app.tick();
         app.poll_logs();
         app.check_processes();
+        app.check_ports();
         app.clear_old_status();
 
         terminal.draw(|f| ui::draw(f, app))?;

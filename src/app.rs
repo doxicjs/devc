@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::Write;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -21,6 +22,7 @@ pub struct ServiceState {
     pub config: ServiceConfig,
     pub process: Option<ProcessHandle>,
     pub status: ServiceStatus,
+    pub port_active: bool,
     pub stopping_since: Option<Instant>,
     pub logs: VecDeque<String>,
 }
@@ -67,6 +69,7 @@ impl App {
                 config: cfg,
                 process: None,
                 status: ServiceStatus::Stopped,
+                port_active: false,
                 stopping_since: None,
                 logs: VecDeque::with_capacity(500),
             })
@@ -389,6 +392,23 @@ impl App {
                     }
                 }
                 ServiceStatus::Stopped => {}
+            }
+        }
+    }
+
+    pub fn check_ports(&mut self) {
+        // Only check every ~2 seconds (20 ticks at 100ms)
+        if self.tick % 20 != 0 {
+            return;
+        }
+        for service in &mut self.services {
+            if let Some(port) = service.config.port {
+                let active = TcpStream::connect_timeout(
+                    &format!("127.0.0.1:{}", port).parse().unwrap(),
+                    Duration::from_millis(50),
+                )
+                .is_ok();
+                service.port_active = active;
             }
         }
     }

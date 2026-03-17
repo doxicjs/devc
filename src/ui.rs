@@ -84,6 +84,7 @@ fn draw_services(f: &mut Frame, app: &App, area: Rect) {
                 ServiceStatus::Running => ("●", Color::Green),
                 ServiceStatus::Starting => (spinner_frame, Color::Yellow),
                 ServiceStatus::Stopping => (spinner_frame, Color::Red),
+                ServiceStatus::Stopped if service.port_active => ("◆", Color::Cyan),
                 ServiceStatus::Stopped => ("○", Color::DarkGray),
             };
 
