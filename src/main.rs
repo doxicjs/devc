@@ -18,9 +18,29 @@ use ratatui::Terminal;
 use app::App;
 use config::Config;
 
+const INSTALL_URL: &str = "https://raw.githubusercontent.com/doxicjs/devc/main/install.sh";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--update" || a == "-u") {
+        println!("Updating devc...");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("curl -fsSL {} | bash", INSTALL_URL))
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("devc {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    let config_path = args
+        .get(1)
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
         .unwrap_or_else(|| "devc.toml".to_string());
 
     let config_path = PathBuf::from(&config_path)
