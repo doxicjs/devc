@@ -1,0 +1,84 @@
+# DevCtl Configuration
+# Reserved keys: q (quit), j/k/↑/↓ (navigate), a/x (start/stop all), Tab (switch tab), Enter (activate)
+
+[general]
+project_root = "../open_party_portal"
+
+# ── Services (Tab 1) ──
+
+[[services]]
+name = "Backend API"
+key = "b"
+command = "docker compose up"
+working_dir = "backend-api"
+service_type = "backend"
+url = "http://localhost:8004/swagger/"
+
+[[services]]
+name = "System Admin"
+key = "1"
+port = 4000
+command = "pnpm dev"
+working_dir = "system-admin"
+service_type = "frontend"
+
+[[services]]
+name = "Election"
+key = "2"
+port = 4001
+command = "pnpm dev"
+working_dir = "election"
+service_type = "frontend"
+
+[[services]]
+name = "National Audit"
+key = "3"
+port = 4002
+command = "pnpm dev"
+working_dir = "national-audit"
+service_type = "frontend"
+
+[[services]]
+name = "Political Party"
+key = "4"
+port = 4003
+command = "pnpm dev"
+working_dir = "political-party"
+service_type = "frontend"
+
+[[services]]
+name = "Private Audit"
+key = "5"
+port = 4004
+command = "pnpm dev"
+working_dir = "private-audit"
+service_type = "frontend"
+
+# ── Links (Tab 2) ── open in browser
+
+[[links]]
+name = "Keycloak Admin"
+key = "k"
+url = "http://localhost:8080/"
+
+# ── Copies (Tab 2) ── copy text to clipboard
+
+[[copies]]
+name = "Keycloak Username"
+key = "u"
+text = "admin"
+
+[[copies]]
+name = "Keycloak Password"
+key = "p"
+text = "O4nnostL"
+
+[[copies]]
+name = "Django Admin Email"
+key = "e"
+text = "admin@aa.aa"
+
+[[copies]]
+name = "Django Admin Password"
+key = "d"
+text = "admin1234!"
