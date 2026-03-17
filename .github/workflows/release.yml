@@ -17,7 +17,7 @@ jobs:
             os: macos-latest
             name: devc-darwin-arm64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             name: devc-darwin-x86_64
     runs-on: ${{ matrix.os }}
     steps:
@@ -51,8 +51,10 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: List assets
+        run: ls -la *.tar.gz
+
       - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: "*.tar.gz"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" *.tar.gz --repo "${{ github.repository }}" --generate-notes
