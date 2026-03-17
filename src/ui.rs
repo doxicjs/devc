@@ -4,7 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Tab, ToolKind};
+use crate::app::{App, ServiceStatus, Tab, ToolKind};
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(f: &mut Frame, app: &App) {
     let outer = Layout::default()
@@ -71,17 +73,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_services(f: &mut Frame, app: &App, area: Rect) {
+    let spinner_frame = SPINNER[app.tick as usize % SPINNER.len()];
+
     let items: Vec<ListItem> = app
         .services
         .iter()
         .enumerate()
         .map(|(i, service)| {
-            let running = service.process.is_some();
-            let status_icon = if running { "●" } else { "○" };
-            let status_color = if running {
-                Color::Green
-            } else {
-                Color::DarkGray
+            let (status_icon, status_color) = match service.status {
+                ServiceStatus::Running => ("●", Color::Green),
+                ServiceStatus::Starting => (spinner_frame, Color::Yellow),
+                ServiceStatus::Stopping => (spinner_frame, Color::Red),
+                ServiceStatus::Stopped => ("○", Color::DarkGray),
             };
 
             let port_str = service

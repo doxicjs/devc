@@ -6,6 +6,7 @@ use std::thread;
 
 pub struct ProcessHandle {
     child: Child,
+    pid: i32,
 }
 
 impl ProcessHandle {
@@ -24,6 +25,7 @@ impl ProcessHandle {
             .process_group(0);
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let pid = child.id() as i32;
 
         if let Some(stdout) = child.stdout.take() {
             let sender = log_sender.clone();
@@ -49,20 +51,26 @@ impl ProcessHandle {
             });
         }
 
-        Ok(Self { child })
+        Ok(Self { child, pid })
+    }
+
+    pub fn send_sigterm(&self) {
+        unsafe {
+            libc::killpg(self.pid, libc::SIGTERM);
+        }
+    }
+
+    pub fn send_sigkill(&self) {
+        unsafe {
+            libc::killpg(self.pid, libc::SIGKILL);
+        }
     }
 
     pub fn kill(&mut self) {
-        let pid = self.child.id() as i32;
-        unsafe {
-            libc::killpg(pid, libc::SIGTERM);
-        }
-        // Give processes time to shut down gracefully
+        self.send_sigterm();
         std::thread::sleep(std::time::Duration::from_millis(500));
         if self.is_running() {
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
-            }
+            self.send_sigkill();
         }
         let _ = self.child.wait();
     }

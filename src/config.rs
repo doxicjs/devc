@@ -2,6 +2,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub general: General,
     pub services: Vec<ServiceConfig>,
     #[serde(default)]
@@ -10,8 +11,13 @@ pub struct Config {
     pub copies: Vec<CopyConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+fn default_project_root() -> String {
+    "./".to_string()
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct General {
+    #[serde(default = "default_project_root")]
     pub project_root: String,
 }
 
@@ -25,6 +31,8 @@ pub struct ServiceConfig {
     pub service_type: String,
     pub port: Option<u16>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 impl ServiceConfig {

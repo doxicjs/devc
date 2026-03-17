@@ -3,15 +3,25 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::config::ServiceConfig;
 use crate::process::ProcessHandle;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStatus {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
 pub struct ServiceState {
     pub config: ServiceConfig,
     pub process: Option<ProcessHandle>,
+    pub status: ServiceStatus,
+    pub stopping_since: Option<Instant>,
     pub logs: VecDeque<String>,
 }
 
@@ -39,6 +49,7 @@ pub struct App {
     pub tools: Vec<ToolItem>,
     pub tools_selected: usize,
     pub status: Option<(String, Instant)>,
+    pub tick: u64,
     log_receiver: mpsc::Receiver<(usize, String)>,
     log_sender: mpsc::Sender<(usize, String)>,
     project_root: PathBuf,
@@ -55,6 +66,8 @@ impl App {
             .map(|cfg| ServiceState {
                 config: cfg,
                 process: None,
+                status: ServiceStatus::Stopped,
+                stopping_since: None,
                 logs: VecDeque::with_capacity(500),
             })
             .collect();
@@ -82,6 +95,7 @@ impl App {
             tools,
             tools_selected: 0,
             status: None,
+            tick: 0,
             log_receiver: rx,
             log_sender: tx,
             project_root,
@@ -141,33 +155,64 @@ impl App {
             return;
         }
 
-        let service = &mut self.services[idx];
-        if service.process.is_some() {
-            if let Some(mut proc) = service.process.take() {
-                proc.kill();
-            }
-            service.logs.push_back("── stopped ──".to_string());
-        } else {
-            let working_dir = self.project_root.join(&service.config.working_dir);
-            let cmd = service.config.full_command();
-            service
-                .logs
-                .push_back(format!("── starting: {} ──", cmd));
+        let status = self.services[idx].status;
 
-            match ProcessHandle::spawn(
-                &cmd,
-                working_dir.to_str().unwrap_or("."),
-                self.log_sender.clone(),
-                idx,
-            ) {
-                Ok(handle) => {
-                    service.process = Some(handle);
+        // Ignore if in transitional state
+        if status == ServiceStatus::Starting || status == ServiceStatus::Stopping {
+            return;
+        }
+
+        if status == ServiceStatus::Running {
+            // Stop: send SIGTERM and enter Stopping state (non-blocking)
+            let service = &mut self.services[idx];
+            if let Some(ref proc) = service.process {
+                proc.send_sigterm();
+            }
+            service.status = ServiceStatus::Stopping;
+            service.stopping_since = Some(Instant::now());
+            service.logs.push_back("── stopping ──".to_string());
+        } else {
+            // Start: ensure dependencies are running first
+            let deps: Vec<String> = self.services[idx].config.depends_on.clone();
+            for dep_name in &deps {
+                if let Some(dep_idx) = self.find_service_by_name(dep_name) {
+                    if self.services[dep_idx].status == ServiceStatus::Stopped {
+                        self.start_service(dep_idx);
+                    }
                 }
-                Err(e) => {
-                    service.logs.push_back(format!("error: {}", e));
-                }
+            }
+            self.start_service(idx);
+        }
+    }
+
+    fn start_service(&mut self, idx: usize) {
+        let service = &mut self.services[idx];
+        service.status = ServiceStatus::Starting;
+
+        let working_dir = self.project_root.join(&service.config.working_dir);
+        let cmd = service.config.full_command();
+        service
+            .logs
+            .push_back(format!("── starting: {} ──", cmd));
+
+        match ProcessHandle::spawn(
+            &cmd,
+            working_dir.to_str().unwrap_or("."),
+            self.log_sender.clone(),
+            idx,
+        ) {
+            Ok(handle) => {
+                service.process = Some(handle);
+            }
+            Err(e) => {
+                service.logs.push_back(format!("error: {}", e));
+                service.status = ServiceStatus::Stopped;
             }
         }
+    }
+
+    fn find_service_by_name(&self, name: &str) -> Option<usize> {
+        self.services.iter().position(|s| s.config.name == name)
     }
 
     pub fn open_service_url(&mut self, idx: usize) {
@@ -191,15 +236,9 @@ impl App {
             .position(|s| s.config.key_char().to_ascii_lowercase() == key_lower)
     }
 
-    pub fn is_running(&self, idx: usize) -> bool {
-        self.services
-            .get(idx)
-            .map_or(false, |s| s.process.is_some())
-    }
-
     pub fn start_all(&mut self) {
         for i in 0..self.services.len() {
-            if !self.is_running(i) {
+            if self.services[i].status == ServiceStatus::Stopped {
                 self.toggle_service(i);
             }
         }
@@ -207,14 +246,17 @@ impl App {
 
     pub fn stop_all(&mut self) {
         for i in 0..self.services.len() {
-            if self.is_running(i) {
+            if self.services[i].status == ServiceStatus::Running {
                 self.toggle_service(i);
             }
         }
     }
 
     pub fn running_count(&self) -> usize {
-        self.services.iter().filter(|s| s.process.is_some()).count()
+        self.services
+            .iter()
+            .filter(|s| s.status == ServiceStatus::Running)
+            .count()
     }
 
     // --- Tools ---
@@ -291,6 +333,10 @@ impl App {
 
     // --- Tick ---
 
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
     pub fn poll_logs(&mut self) {
         while let Ok((idx, line)) = self.log_receiver.try_recv() {
             if let Some(service) = self.services.get_mut(idx) {
@@ -304,11 +350,45 @@ impl App {
 
     pub fn check_processes(&mut self) {
         for service in &mut self.services {
-            if let Some(proc) = &mut service.process {
-                if !proc.is_running() {
-                    service.process = None;
-                    service.logs.push_back("── process exited ──".to_string());
+            match service.status {
+                ServiceStatus::Starting => {
+                    if let Some(proc) = &mut service.process {
+                        if proc.is_running() {
+                            service.status = ServiceStatus::Running;
+                        } else {
+                            service.process = None;
+                            service.status = ServiceStatus::Stopped;
+                            service.logs.push_back("── process exited ──".to_string());
+                        }
+                    }
                 }
+                ServiceStatus::Running => {
+                    if let Some(proc) = &mut service.process {
+                        if !proc.is_running() {
+                            service.process = None;
+                            service.status = ServiceStatus::Stopped;
+                            service.logs.push_back("── process exited ──".to_string());
+                        }
+                    }
+                }
+                ServiceStatus::Stopping => {
+                    if let Some(proc) = &mut service.process {
+                        if !proc.is_running() {
+                            service.process = None;
+                            service.status = ServiceStatus::Stopped;
+                            service.stopping_since = None;
+                            service.logs.push_back("── stopped ──".to_string());
+                        } else if let Some(since) = service.stopping_since {
+                            if since.elapsed() > Duration::from_millis(500) {
+                                proc.send_sigkill();
+                            }
+                        }
+                    } else {
+                        service.status = ServiceStatus::Stopped;
+                        service.stopping_since = None;
+                    }
+                }
+                ServiceStatus::Stopped => {}
             }
         }
     }

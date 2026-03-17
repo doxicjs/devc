@@ -83,6 +83,7 @@ fn run(
     app: &mut App,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
+        app.tick();
         app.poll_logs();
         app.check_processes();
         app.clear_old_status();
