@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::Write;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -190,6 +190,15 @@ impl App {
 
     fn start_service(&mut self, idx: usize) {
         let service = &mut self.services[idx];
+
+        if service.port_active {
+            service.logs.push_back(format!(
+                "── port {} already in use ──",
+                service.config.port.unwrap()
+            ));
+            return;
+        }
+
         service.status = ServiceStatus::Starting;
 
         let working_dir = self.project_root.join(&service.config.working_dir);
@@ -397,17 +406,20 @@ impl App {
     }
 
     pub fn check_ports(&mut self) {
-        // Only check every ~2 seconds (20 ticks at 100ms)
-        if self.tick % 20 != 0 {
+        // Check on first tick, then every ~2 seconds
+        if self.tick % 20 != 1 {
             return;
         }
         for service in &mut self.services {
             if let Some(port) = service.config.port {
-                let active = TcpStream::connect_timeout(
-                    &format!("127.0.0.1:{}", port).parse().unwrap(),
-                    Duration::from_millis(50),
-                )
-                .is_ok();
+                let timeout = Duration::from_millis(50);
+                let addrs: [SocketAddr; 2] = [
+                    format!("127.0.0.1:{}", port).parse().unwrap(),
+                    format!("[::1]:{}", port).parse().unwrap(),
+                ];
+                let active = addrs
+                    .iter()
+                    .any(|addr| TcpStream::connect_timeout(addr, timeout).is_ok());
                 service.port_active = active;
             }
         }
