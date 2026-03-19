@@ -1,3 +1,4 @@
+use ansi_to_tui::IntoText;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -140,14 +141,17 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let log_lines: Vec<Line> = service
         .logs
         .iter()
-        .map(|l| {
+        .flat_map(|l| {
             if l.starts_with("──") {
-                Line::from(Span::styled(
+                vec![Line::from(Span::styled(
                     l.as_str(),
                     Style::default().fg(Color::DarkGray),
-                ))
+                ))]
             } else {
-                Line::from(l.as_str())
+                l.as_bytes()
+                    .into_text()
+                    .map(|t| t.lines)
+                    .unwrap_or_else(|_| vec![Line::from(l.as_str())])
             }
         })
         .collect();
@@ -232,14 +236,17 @@ fn draw_command_logs(f: &mut Frame, app: &App, area: Rect) {
     let log_lines: Vec<Line> = cmd
         .logs
         .iter()
-        .map(|l| {
+        .flat_map(|l| {
             if l.starts_with("──") {
-                Line::from(Span::styled(
+                vec![Line::from(Span::styled(
                     l.as_str(),
                     Style::default().fg(Color::DarkGray),
-                ))
+                ))]
             } else {
-                Line::from(l.as_str())
+                l.as_bytes()
+                    .into_text()
+                    .map(|t| t.lines)
+                    .unwrap_or_else(|_| vec![Line::from(l.as_str())])
             }
         })
         .collect();
