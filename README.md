@@ -1,4 +1,4 @@
-# devc
+# devc - Dev Control
 
 TUI dashboard for managing local dev services.
 
