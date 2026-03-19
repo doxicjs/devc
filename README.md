@@ -49,6 +49,7 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 - **Dependencies** — services listed in `depends_on` are started automatically before the dependent service
 - **Stop signal** — services receive `SIGTERM` first, then `SIGKILL` after 500ms if still running
 - **Log buffer** — last 500 lines of output are kept per service/command
+- **ANSI colors** — log panels render ANSI escape sequences (16 standard colors, 256 indexed, 24-bit RGB, bold, dim, italic, underline, strikethrough, and more)
 - **Status messages** — flash for 3 seconds then disappear
 - **Startup tab** — opens on the Services tab
 - **Sections** — `commands`, `links`, `copies`, and `[general]` are all optional; only `services` is required
