@@ -45,9 +45,11 @@ echo "Installing to $INSTALL_DIR/$BINARY_NAME..."
 if [ -w "$INSTALL_DIR" ]; then
   cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BINARY_NAME"
   chmod +x "$INSTALL_DIR/$BINARY_NAME"
+  xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
 else
   sudo cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BINARY_NAME"
   sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
+  sudo xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
 fi
 
 echo ""
