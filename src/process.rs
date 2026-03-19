@@ -20,6 +20,7 @@ impl ProcessHandle {
         cmd.arg("-c")
             .arg(command)
             .current_dir(working_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
