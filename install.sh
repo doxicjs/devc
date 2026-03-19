@@ -7,13 +7,33 @@ INSTALL_DIR="/usr/local/bin"
 
 echo "Installing $BINARY_NAME..."
 
-# Detect architecture
+# Detect OS and architecture
+OS=$(uname -s)
 ARCH=$(uname -m)
-case "$ARCH" in
-  arm64|aarch64) ASSET="devc-darwin-arm64.tar.gz" ;;
-  x86_64)        ASSET="devc-darwin-x86_64.tar.gz" ;;
+
+case "$OS" in
+  Darwin)
+    case "$ARCH" in
+      arm64|aarch64) ASSET="devc-darwin-arm64.tar.gz" ;;
+      x86_64)        ASSET="devc-darwin-x86_64.tar.gz" ;;
+      *)
+        echo "Error: unsupported architecture $ARCH on macOS"
+        exit 1
+        ;;
+    esac
+    ;;
+  Linux)
+    case "$ARCH" in
+      aarch64) ASSET="devc-linux-arm64.tar.gz" ;;
+      x86_64)  ASSET="devc-linux-x86_64.tar.gz" ;;
+      *)
+        echo "Error: unsupported architecture $ARCH on Linux"
+        exit 1
+        ;;
+    esac
+    ;;
   *)
-    echo "Error: unsupported architecture $ARCH"
+    echo "Error: unsupported OS $OS"
     exit 1
     ;;
 esac
@@ -40,19 +60,25 @@ tar xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 # Find the binary (name without extension)
 BIN_NAME="${ASSET%.tar.gz}"
 
-# Install — remove first so the old inode stays alive for any running process,
-# then cp creates a new file at a fresh inode (avoids corrupting a running binary)
+# Install
 echo "Installing to $INSTALL_DIR/$BINARY_NAME..."
 if [ -w "$INSTALL_DIR" ]; then
   rm -f "$INSTALL_DIR/$BINARY_NAME"
   cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BINARY_NAME"
   chmod +x "$INSTALL_DIR/$BINARY_NAME"
-  xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
 else
   sudo rm -f "$INSTALL_DIR/$BINARY_NAME"
   sudo cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BINARY_NAME"
   sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
-  sudo xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
+fi
+
+# macOS: remove quarantine attribute
+if [ "$(uname -s)" = "Darwin" ]; then
+  if [ -w "$INSTALL_DIR" ]; then
+    xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
+  else
+    sudo xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
+  fi
 fi
 
 echo ""

@@ -9,6 +9,53 @@ use crate::app::{App, CommandStatus, ServiceStatus, Tab, ToolKind};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Build a scrollable log panel. `scroll_offset` is lines from bottom (0 = auto-scroll).
+fn render_log_panel(
+    f: &mut Frame,
+    logs: &std::collections::VecDeque<String>,
+    title: String,
+    scroll_offset: usize,
+    area: Rect,
+) {
+    let log_lines: Vec<Line> = logs
+        .iter()
+        .flat_map(|l| {
+            if l.starts_with("──") {
+                vec![Line::from(Span::styled(
+                    l.as_str(),
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                l.as_bytes()
+                    .into_text()
+                    .map(|t| t.lines)
+                    .unwrap_or_else(|_| vec![Line::from(l.as_str())])
+            }
+        })
+        .collect();
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let total = log_lines.len();
+    let max_scroll = total.saturating_sub(visible_height);
+    let scroll = if scroll_offset == 0 {
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(scroll_offset)
+    };
+
+    let paragraph = Paragraph::new(log_lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
+
+    f.render_widget(paragraph, area);
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -135,41 +182,23 @@ fn draw_services(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
-    let service = &app.services[app.selected];
-    let title = format!(" {} ", service.config.name);
-
-    let log_lines: Vec<Line> = service
-        .logs
-        .iter()
-        .flat_map(|l| {
-            if l.starts_with("──") {
-                vec![Line::from(Span::styled(
-                    l.as_str(),
-                    Style::default().fg(Color::DarkGray),
-                ))]
-            } else {
-                l.as_bytes()
-                    .into_text()
-                    .map(|t| t.lines)
-                    .unwrap_or_else(|_| vec![Line::from(l.as_str())])
-            }
-        })
-        .collect();
-
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let scroll = log_lines.len().saturating_sub(visible_height) as u16;
-
-    let paragraph = Paragraph::new(log_lines)
-        .block(
+    let Some(service) = app.services.get(app.selected) else {
+        let empty = Paragraph::new("No services configured").block(
             Block::default()
-                .title(title)
+                .title(" Logs ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-
-    f.render_widget(paragraph, area);
+        );
+        f.render_widget(empty, area);
+        return;
+    };
+    render_log_panel(
+        f,
+        &service.logs,
+        format!(" {} ", service.config.name),
+        app.log_scroll_offset,
+        area,
+    );
 }
 
 fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
@@ -230,41 +259,13 @@ fn draw_command_logs(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(empty, area);
         return;
     };
-
-    let title = format!(" {} ", cmd.config.name);
-
-    let log_lines: Vec<Line> = cmd
-        .logs
-        .iter()
-        .flat_map(|l| {
-            if l.starts_with("──") {
-                vec![Line::from(Span::styled(
-                    l.as_str(),
-                    Style::default().fg(Color::DarkGray),
-                ))]
-            } else {
-                l.as_bytes()
-                    .into_text()
-                    .map(|t| t.lines)
-                    .unwrap_or_else(|_| vec![Line::from(l.as_str())])
-            }
-        })
-        .collect();
-
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let scroll = log_lines.len().saturating_sub(visible_height) as u16;
-
-    let paragraph = Paragraph::new(log_lines)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-
-    f.render_widget(paragraph, area);
+    render_log_panel(
+        f,
+        &cmd.logs,
+        format!(" {} ", cmd.config.name),
+        app.cmd_log_scroll_offset,
+        area,
+    );
 }
 
 fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
@@ -385,13 +386,17 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("a", Style::default().fg(Color::Yellow)),
                 Span::raw(" start all  "),
                 Span::styled("x", Style::default().fg(Color::Yellow)),
-                Span::raw(" stop all"),
+                Span::raw(" stop all  "),
+                Span::styled("PgUp/Dn", Style::default().fg(Color::Yellow)),
+                Span::raw(" scroll"),
             ]);
         }
         Tab::Commands => {
             spans.extend([
                 Span::styled("[key]", Style::default().fg(Color::Yellow)),
-                Span::raw(" run command"),
+                Span::raw(" run command  "),
+                Span::styled("PgUp/Dn", Style::default().fg(Color::Yellow)),
+                Span::raw(" scroll"),
             ]);
         }
         Tab::Tools => {
@@ -403,4 +408,152 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::config::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn svc(name: &str, key: &str) -> ServiceConfig {
+        ServiceConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            command: format!("echo {}", name),
+            working_dir: "./".to_string(),
+            service_type: "generic".to_string(),
+            port: None,
+            url: None,
+            depends_on: vec![],
+        }
+    }
+
+    fn cmd(name: &str, key: &str) -> CommandConfig {
+        CommandConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            command: format!("echo {}", name),
+            working_dir: "./".to_string(),
+        }
+    }
+
+    fn make_config(services: Vec<ServiceConfig>, commands: Vec<CommandConfig>) -> Config {
+        Config {
+            general: General { project_root: "./".to_string() },
+            services,
+            commands,
+            links: vec![],
+            copies: vec![],
+        }
+    }
+
+    // ===== Issue #1: draw with empty services must NOT panic =====
+
+    #[test]
+    fn draw_with_empty_services_does_not_panic() {
+        let config = make_config(vec![], vec![cmd("build", "b")]);
+        let app = App::new(config, PathBuf::from("/tmp"));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Panics on current code: draw_logs does app.services[app.selected]
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn draw_with_empty_everything_does_not_panic() {
+        let config = make_config(vec![], vec![]);
+        let app = App::new(config, PathBuf::from("/tmp"));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    // ===== Normal rendering =====
+
+    #[test]
+    fn draw_services_tab_with_services() {
+        let config = make_config(vec![svc("web", "w"), svc("api", "a")], vec![]);
+        let app = App::new(config, PathBuf::from("/tmp"));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn draw_commands_tab_no_commands() {
+        let config = make_config(vec![svc("web", "w")], vec![]);
+        let mut app = App::new(config, PathBuf::from("/tmp"));
+        app.tab = Tab::Commands;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn draw_commands_tab_with_commands() {
+        let config = make_config(vec![], vec![cmd("build", "b"), cmd("test", "t")]);
+        let mut app = App::new(config, PathBuf::from("/tmp"));
+        app.tab = Tab::Commands;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn draw_tools_tab_empty() {
+        let config = make_config(vec![], vec![]);
+        let mut app = App::new(config, PathBuf::from("/tmp"));
+        app.tab = Tab::Tools;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn draw_tools_tab_with_links_and_copies() {
+        let config = Config {
+            general: General { project_root: "./".to_string() },
+            services: vec![],
+            commands: vec![],
+            links: vec![LinkConfig {
+                name: "Docs".to_string(),
+                key: "d".to_string(),
+                url: "https://docs.example.com".to_string(),
+            }],
+            copies: vec![CopyConfig {
+                name: "Token".to_string(),
+                key: "t".to_string(),
+                text: "abc123".to_string(),
+            }],
+        };
+        let mut app = App::new(config, PathBuf::from("/tmp"));
+        app.tab = Tab::Tools;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    // ===== Edge cases =====
+
+    #[test]
+    fn draw_with_tiny_terminal() {
+        let config = make_config(vec![svc("web", "w")], vec![]);
+        let app = App::new(config, PathBuf::from("/tmp"));
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn draw_with_single_row_terminal() {
+        let config = make_config(vec![svc("web", "w")], vec![]);
+        let app = App::new(config, PathBuf::from("/tmp"));
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+    }
 }

@@ -43,16 +43,15 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 
 - **Config file** — reads `./devc.toml` from the current directory
 - **Project root** — defaults to `./` (the directory containing `devc.toml`)
-- **Port flag** — when `port` is set on a service, `--port <n>` is appended to the command automatically
+- **Port monitoring** — when `port` is set, devc checks it every ~2s on IPv4 and IPv6 loopback and shows a status icon; include the port flag in your command if the service needs it
 - **Service URL** — if `url` is not set but `port` is, `Space` opens `http://localhost:<port>/`
-- **Port monitoring** — ports are checked every ~2 seconds on both IPv4 and IPv6 loopback
 - **Dependencies** — services listed in `depends_on` are started automatically before the dependent service
-- **Stop signal** — services receive `SIGTERM` first, then `SIGKILL` after 500ms if still running
+- **Stop signal** — services receive `SIGTERM` first, then `SIGKILL` after 3s if still running
 - **Log buffer** — last 500 lines of output are kept per service/command
 - **ANSI colors** — log panels render ANSI escape sequences (16 standard colors, 256 indexed, 24-bit RGB, bold, dim, italic, underline, strikethrough, and more)
 - **Status messages** — flash for 3 seconds then disappear
 - **Startup tab** — opens on the Services tab
-- **Sections** — `commands`, `links`, `copies`, and `[general]` are all optional; only `services` is required
+- **Sections** — all sections are optional including `services`; unknown fields are rejected with a clear error
 
 ### Configuration
 
@@ -104,7 +103,7 @@ text = "your-api-key"
 | `command`      | yes      | Shell command to start the service                   |
 | `working_dir`  | yes      | Working directory (relative to `project_root`)       |
 | `service_type` | yes      | Type label (e.g. `backend`, `frontend`)              |
-| `port`         | no       | Port to monitor; auto-appended as `--port <n>`       |
+| `port`         | no       | Port to monitor (1–65535); shown in service list      |
 | `url`          | no       | URL to open with `Space` (defaults to `localhost:port`) |
 | `depends_on`   | no       | Array of service names to start first                |
 
