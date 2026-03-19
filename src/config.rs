@@ -6,6 +6,8 @@ pub struct Config {
     pub general: General,
     pub services: Vec<ServiceConfig>,
     #[serde(default)]
+    pub commands: Vec<CommandConfig>,
+    #[serde(default)]
     pub links: Vec<LinkConfig>,
     #[serde(default)]
     pub copies: Vec<CopyConfig>,
@@ -52,6 +54,20 @@ impl ServiceConfig {
             cmd.push_str(&format!(" --port {}", port));
         }
         cmd
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommandConfig {
+    pub name: String,
+    pub key: String,
+    pub command: String,
+    pub working_dir: String,
+}
+
+impl CommandConfig {
+    pub fn key_char(&self) -> char {
+        self.key.chars().next().unwrap_or('?')
     }
 }
 

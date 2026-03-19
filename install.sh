@@ -40,13 +40,16 @@ tar xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 # Find the binary (name without extension)
 BIN_NAME="${ASSET%.tar.gz}"
 
-# Install
+# Install — remove first so the old inode stays alive for any running process,
+# then cp creates a new file at a fresh inode (avoids corrupting a running binary)
 echo "Installing to $INSTALL_DIR/$BINARY_NAME..."
 if [ -w "$INSTALL_DIR" ]; then
+  rm -f "$INSTALL_DIR/$BINARY_NAME"
   cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BINARY_NAME"
   chmod +x "$INSTALL_DIR/$BINARY_NAME"
   xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
 else
+  sudo rm -f "$INSTALL_DIR/$BINARY_NAME"
   sudo cp "$TMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BINARY_NAME"
   sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
   sudo xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true

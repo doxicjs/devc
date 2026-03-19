@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::config::ServiceConfig;
+use crate::config::CommandConfig;
 use crate::process::ProcessHandle;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,9 +29,25 @@ pub struct ServiceState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CommandStatus {
+    Idle,
+    Running,
+    Done,
+    Failed,
+}
+
+pub struct CommandState {
+    pub config: CommandConfig,
+    pub process: Option<ProcessHandle>,
+    pub status: CommandStatus,
+    pub logs: VecDeque<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Services = 0,
-    Tools = 1,
+    Commands = 1,
+    Tools = 2,
 }
 
 pub enum ToolKind {
@@ -44,16 +61,24 @@ pub struct ToolItem {
     pub kind: ToolKind,
 }
 
+/// Log messages are tagged with a source: Service(idx) or Command(idx)
+pub enum LogSource {
+    Service(usize),
+    Command(usize),
+}
+
 pub struct App {
     pub services: Vec<ServiceState>,
+    pub commands: Vec<CommandState>,
+    pub commands_selected: usize,
     pub selected: usize,
     pub tab: Tab,
     pub tools: Vec<ToolItem>,
     pub tools_selected: usize,
     pub status: Option<(String, Instant)>,
     pub tick: u64,
-    log_receiver: mpsc::Receiver<(usize, String)>,
-    log_sender: mpsc::Sender<(usize, String)>,
+    log_receiver: mpsc::Receiver<(LogSource, String)>,
+    log_sender: mpsc::Sender<(LogSource, String)>,
     project_root: PathBuf,
 }
 
@@ -71,6 +96,17 @@ impl App {
                 status: ServiceStatus::Stopped,
                 port_active: false,
                 stopping_since: None,
+                logs: VecDeque::with_capacity(500),
+            })
+            .collect();
+
+        let commands = config
+            .commands
+            .into_iter()
+            .map(|cfg| CommandState {
+                config: cfg,
+                process: None,
+                status: CommandStatus::Idle,
                 logs: VecDeque::with_capacity(500),
             })
             .collect();
@@ -93,6 +129,8 @@ impl App {
 
         Self {
             services,
+            commands,
+            commands_selected: 0,
             selected: 0,
             tab: Tab::Services,
             tools,
@@ -109,7 +147,8 @@ impl App {
 
     pub fn next_tab(&mut self) {
         self.tab = match self.tab {
-            Tab::Services => Tab::Tools,
+            Tab::Services => Tab::Commands,
+            Tab::Commands => Tab::Tools,
             Tab::Tools => Tab::Services,
         };
     }
@@ -119,6 +158,7 @@ impl App {
     pub fn select_up(&mut self) {
         match self.tab {
             Tab::Services => self.selected = self.selected.saturating_sub(1),
+            Tab::Commands => self.commands_selected = self.commands_selected.saturating_sub(1),
             Tab::Tools => self.tools_selected = self.tools_selected.saturating_sub(1),
         }
     }
@@ -128,6 +168,11 @@ impl App {
             Tab::Services => {
                 if self.selected + 1 < self.services.len() {
                     self.selected += 1;
+                }
+            }
+            Tab::Commands => {
+                if self.commands_selected + 1 < self.commands.len() {
+                    self.commands_selected += 1;
                 }
             }
             Tab::Tools => {
@@ -143,6 +188,10 @@ impl App {
             Tab::Services => {
                 let idx = self.selected;
                 self.toggle_service(idx);
+            }
+            Tab::Commands => {
+                let idx = self.commands_selected;
+                self.run_command(idx);
             }
             Tab::Tools => {
                 let idx = self.tools_selected;
@@ -212,7 +261,8 @@ impl App {
             working_dir.to_str().unwrap_or("."),
             self.log_sender.clone(),
             idx,
-        ) {
+        )
+        {
             Ok(handle) => {
                 service.process = Some(handle);
             }
@@ -271,6 +321,55 @@ impl App {
             .count()
     }
 
+    // --- Commands ---
+
+    pub fn run_command(&mut self, idx: usize) {
+        if idx >= self.commands.len() {
+            return;
+        }
+
+        // Don't run if already running
+        if self.commands[idx].status == CommandStatus::Running {
+            return;
+        }
+
+        let cmd_state = &mut self.commands[idx];
+        cmd_state.logs.clear();
+        cmd_state.status = CommandStatus::Running;
+
+        let working_dir = self.project_root.join(&cmd_state.config.working_dir);
+        let cmd = cmd_state.config.command.clone();
+        cmd_state
+            .logs
+            .push_back(format!("── running: {} ──", cmd));
+
+        let sender = self.log_sender.clone();
+        let cmd_idx = idx;
+
+        match ProcessHandle::spawn_tagged(
+            &cmd,
+            working_dir.to_str().unwrap_or("."),
+            sender,
+            cmd_idx,
+            true,
+        ) {
+            Ok(handle) => {
+                cmd_state.process = Some(handle);
+            }
+            Err(e) => {
+                cmd_state.logs.push_back(format!("error: {}", e));
+                cmd_state.status = CommandStatus::Failed;
+            }
+        }
+    }
+
+    pub fn find_command_by_key(&self, key: char) -> Option<usize> {
+        let key_lower = key.to_ascii_lowercase();
+        self.commands
+            .iter()
+            .position(|c| c.config.key_char().to_ascii_lowercase() == key_lower)
+    }
+
     // --- Tools ---
 
     pub fn find_tool_by_key(&self, key: char) -> Option<usize> {
@@ -321,6 +420,11 @@ impl App {
                     }
                 }
             },
+            Tab::Commands => {
+                if let Some(idx) = self.find_command_by_key(c) {
+                    self.run_command(idx);
+                }
+            }
             Tab::Tools => {
                 if let Some(idx) = self.find_tool_by_key(c) {
                     self.activate_tool(idx);
@@ -350,11 +454,23 @@ impl App {
     }
 
     pub fn poll_logs(&mut self) {
-        while let Ok((idx, line)) = self.log_receiver.try_recv() {
-            if let Some(service) = self.services.get_mut(idx) {
-                service.logs.push_back(line);
-                if service.logs.len() > 500 {
-                    service.logs.pop_front();
+        while let Ok((source, line)) = self.log_receiver.try_recv() {
+            match source {
+                LogSource::Service(idx) => {
+                    if let Some(service) = self.services.get_mut(idx) {
+                        service.logs.push_back(line);
+                        if service.logs.len() > 500 {
+                            service.logs.pop_front();
+                        }
+                    }
+                }
+                LogSource::Command(idx) => {
+                    if let Some(cmd) = self.commands.get_mut(idx) {
+                        cmd.logs.push_back(line);
+                        if cmd.logs.len() > 500 {
+                            cmd.logs.pop_front();
+                        }
+                    }
                 }
             }
         }
@@ -401,6 +517,28 @@ impl App {
                     }
                 }
                 ServiceStatus::Stopped => {}
+            }
+        }
+
+        // Check command processes
+        for cmd in &mut self.commands {
+            if cmd.status == CommandStatus::Running {
+                if let Some(proc) = &mut cmd.process {
+                    if !proc.is_running() {
+                        let exit_code = proc.exit_code();
+                        cmd.process = None;
+                        if exit_code == Some(0) {
+                            cmd.status = CommandStatus::Done;
+                            cmd.logs.push_back("── done ──".to_string());
+                        } else {
+                            cmd.status = CommandStatus::Failed;
+                            cmd.logs.push_back(format!(
+                                "── failed (exit {}) ──",
+                                exit_code.map(|c| c.to_string()).unwrap_or("?".into())
+                            ));
+                        }
+                    }
+                }
             }
         }
     }

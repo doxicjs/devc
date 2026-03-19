@@ -56,8 +56,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config =
         toml::from_str(&config_str).map_err(|e| format!("Failed to parse config: {}", e))?;
 
-    if config.services.is_empty() {
-        eprintln!("No services defined in config");
+    if config.services.is_empty() && config.commands.is_empty() {
+        eprintln!("No services or commands defined in config");
         return Ok(());
     }
 

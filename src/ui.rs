@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ServiceStatus, Tab, ToolKind};
+use crate::app::{App, CommandStatus, ServiceStatus, Tab, ToolKind};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -30,6 +30,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             draw_services(f, app, main[0]);
             draw_logs(f, app, main[1]);
         }
+        Tab::Commands => {
+            draw_commands(f, app, main[0]);
+            draw_command_logs(f, app, main[1]);
+        }
         Tab::Tools => {
             draw_tools(f, app, main[0]);
             draw_tool_detail(f, app, main[1]);
@@ -43,7 +47,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let running = app.running_count();
     let total = app.services.len();
 
-    let tabs = Tabs::new(vec!["Services", "Tools"])
+    let tabs = Tabs::new(vec!["Services", "Commands", "Tools"])
         .select(app.tab as usize)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
@@ -134,6 +138,98 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(" {} ", service.config.name);
 
     let log_lines: Vec<Line> = service
+        .logs
+        .iter()
+        .map(|l| {
+            if l.starts_with("──") {
+                Line::from(Span::styled(
+                    l.as_str(),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            } else {
+                Line::from(l.as_str())
+            }
+        })
+        .collect();
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let scroll = log_lines.len().saturating_sub(visible_height) as u16;
+
+    let paragraph = Paragraph::new(log_lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    f.render_widget(paragraph, area);
+}
+
+fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
+    let spinner_frame = SPINNER[app.tick as usize % SPINNER.len()];
+
+    let items: Vec<ListItem> = app
+        .commands
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let (status_icon, status_color) = match cmd.status {
+                CommandStatus::Idle => ("○", Color::DarkGray),
+                CommandStatus::Running => (spinner_frame, Color::Yellow),
+                CommandStatus::Done => ("✓", Color::Green),
+                CommandStatus::Failed => ("✗", Color::Red),
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" [{}] ", cmd.config.key_char().to_ascii_uppercase()),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
+                Span::styled(&cmd.config.name, Style::default().fg(Color::White)),
+            ]);
+
+            let item = ListItem::new(line);
+            if i == app.commands_selected {
+                item.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                item
+            }
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Commands ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    f.render_widget(list, area);
+}
+
+fn draw_command_logs(f: &mut Frame, app: &App, area: Rect) {
+    let Some(cmd) = app.commands.get(app.commands_selected) else {
+        let empty = Paragraph::new("No commands configured").block(
+            Block::default()
+                .title(" Output ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        f.render_widget(empty, area);
+        return;
+    };
+
+    let title = format!(" {} ", cmd.config.name);
+
+    let log_lines: Vec<Line> = cmd
         .logs
         .iter()
         .map(|l| {
@@ -283,6 +379,12 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" start all  "),
                 Span::styled("x", Style::default().fg(Color::Yellow)),
                 Span::raw(" stop all"),
+            ]);
+        }
+        Tab::Commands => {
+            spans.extend([
+                Span::styled("[key]", Style::default().fg(Color::Yellow)),
+                Span::raw(" run command"),
             ]);
         }
         Tab::Tools => {
