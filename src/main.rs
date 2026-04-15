@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::App;
-use config::Config;
+use config::{Config, LocalConfig};
 
 const INSTALL_URL: &str = "https://raw.githubusercontent.com/doxicjs/devc/main/install.sh";
 
@@ -73,8 +73,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_path_buf();
 
     let config_str = std::fs::read_to_string(&config_path)?;
-    let config: Config =
+    let mut config: Config =
         toml::from_str(&config_str).map_err(|e| format!("Failed to parse config: {}", e))?;
+
+    if let Some(local_path) = local_config_path(&config_path) {
+        if local_path.exists() {
+            let local_str = std::fs::read_to_string(&local_path)?;
+            let local: LocalConfig = toml::from_str(&local_str).map_err(|e| {
+                format!("Failed to parse local config '{}': {}", local_path.display(), e)
+            })?;
+            config.merge_local(local);
+        }
+    }
 
     if config.services.is_empty() && config.commands.is_empty() {
         eprintln!("No services or commands defined in config");
@@ -110,6 +120,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     result
+}
+
+fn local_config_path(main_path: &std::path::Path) -> Option<PathBuf> {
+    let parent = main_path.parent()?;
+    let file_name = main_path.file_name()?.to_str()?;
+    let local_name = match main_path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            let stem = main_path.file_stem()?.to_str()?;
+            format!("{}.local.{}", stem, ext)
+        }
+        None => format!("{}.local", file_name),
+    };
+    Some(parent.join(local_name))
 }
 
 fn run(

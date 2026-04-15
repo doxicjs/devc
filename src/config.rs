@@ -108,6 +108,54 @@ pub struct CopyConfig {
     pub text: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct LocalConfig {
+    #[serde(default)]
+    pub general: Option<LocalGeneral>,
+    #[serde(default)]
+    pub services: Vec<ServiceConfig>,
+    #[serde(default)]
+    pub commands: Vec<CommandConfig>,
+    #[serde(default)]
+    pub links: Vec<LinkConfig>,
+    #[serde(default)]
+    pub copies: Vec<CopyConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct LocalGeneral {
+    #[serde(default)]
+    pub project_root: Option<String>,
+}
+
+impl Config {
+    pub fn merge_local(&mut self, local: LocalConfig) {
+        if let Some(general) = local.general {
+            if let Some(project_root) = general.project_root {
+                self.general.project_root = project_root;
+            }
+        }
+        merge_by_name(&mut self.services, local.services, |s| &s.name);
+        merge_by_name(&mut self.commands, local.commands, |c| &c.name);
+        merge_by_name(&mut self.links, local.links, |l| &l.name);
+        merge_by_name(&mut self.copies, local.copies, |c| &c.name);
+    }
+}
+
+fn merge_by_name<T, F>(base: &mut Vec<T>, overlay: Vec<T>, name_of: F)
+where
+    F: Fn(&T) -> &String,
+{
+    for item in overlay {
+        if let Some(existing) = base.iter_mut().find(|b| name_of(b) == name_of(&item)) {
+            *existing = item;
+        } else {
+            base.push(item);
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +168,19 @@ mod tests {
             working_dir: "./".to_string(),
             service_type: "generic".to_string(),
             port,
+            url: None,
+            depends_on: vec![],
+        }
+    }
+
+    fn svc(name: &str, key: &str, command: &str) -> ServiceConfig {
+        ServiceConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            command: command.to_string(),
+            working_dir: ".".to_string(),
+            service_type: "backend".to_string(),
+            port: None,
             url: None,
             depends_on: vec![],
         }
@@ -356,5 +417,143 @@ port = 0
 "#;
         let config: Result<Config, _> = toml::from_str(toml_str);
         assert!(config.is_err(), "Port 0 should be rejected");
+    }
+
+    // ===== Local override merge =====
+
+    fn cmd(name: &str, key: &str, command: &str) -> CommandConfig {
+        CommandConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            command: command.to_string(),
+            working_dir: ".".to_string(),
+        }
+    }
+
+    fn link(name: &str, key: &str, url: &str) -> LinkConfig {
+        LinkConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            url: url.to_string(),
+        }
+    }
+
+    fn copy(name: &str, key: &str, text: &str) -> CopyConfig {
+        CopyConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    fn base_config() -> Config {
+        Config {
+            general: General {
+                project_root: "./main".to_string(),
+            },
+            services: vec![svc("API", "a", "api"), svc("Web", "w", "web")],
+            commands: vec![cmd("Migrate", "m", "migrate")],
+            links: vec![link("Docs", "d", "https://docs")],
+            copies: vec![copy("Token", "t", "secret")],
+        }
+    }
+
+    #[test]
+    fn merge_local_appends_new_items() {
+        let mut config = base_config();
+        let local = LocalConfig {
+            services: vec![svc("Scratch", "s", "scratch")],
+            commands: vec![cmd("Seed", "e", "seed")],
+            links: vec![link("Local Admin", "l", "http://localhost:9000")],
+            copies: vec![copy("Dev Key", "k", "dev")],
+            ..Default::default()
+        };
+
+        config.merge_local(local);
+
+        assert_eq!(config.services.len(), 3);
+        assert_eq!(config.services[2].name, "Scratch");
+        assert_eq!(config.commands.len(), 2);
+        assert_eq!(config.commands[1].name, "Seed");
+        assert_eq!(config.links.len(), 2);
+        assert_eq!(config.links[1].name, "Local Admin");
+        assert_eq!(config.copies.len(), 2);
+        assert_eq!(config.copies[1].name, "Dev Key");
+    }
+
+    #[test]
+    fn merge_local_overrides_by_name() {
+        let mut config = base_config();
+        let local = LocalConfig {
+            services: vec![svc("Web", "w", "pnpm dev --debug")],
+            ..Default::default()
+        };
+
+        config.merge_local(local);
+
+        assert_eq!(config.services.len(), 2);
+        assert_eq!(config.services[0].name, "API");
+        assert_eq!(config.services[1].name, "Web");
+        assert_eq!(config.services[1].command, "pnpm dev --debug");
+    }
+
+    #[test]
+    fn merge_local_general_field_by_field() {
+        let mut config = base_config();
+        let local = LocalConfig {
+            general: Some(LocalGeneral {
+                project_root: Some("./override".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        config.merge_local(local);
+
+        assert_eq!(config.general.project_root, "./override");
+    }
+
+    #[test]
+    fn merge_local_general_absent_leaves_main_untouched() {
+        let mut config = base_config();
+        let local = LocalConfig {
+            general: Some(LocalGeneral {
+                project_root: None,
+            }),
+            ..Default::default()
+        };
+
+        config.merge_local(local);
+
+        assert_eq!(config.general.project_root, "./main");
+    }
+
+    #[test]
+    fn merge_local_empty_is_noop() {
+        let mut config = base_config();
+        config.merge_local(LocalConfig::default());
+
+        assert_eq!(config.general.project_root, "./main");
+        assert_eq!(config.services.len(), 2);
+        assert_eq!(config.commands.len(), 1);
+        assert_eq!(config.links.len(), 1);
+        assert_eq!(config.copies.len(), 1);
+    }
+
+    #[test]
+    fn merge_local_section_name_isolation() {
+        let mut config = base_config();
+        let local = LocalConfig {
+            services: vec![svc("Migrate", "g", "different-service")],
+            commands: vec![cmd("Migrate", "m", "migrate-v2")],
+            ..Default::default()
+        };
+
+        config.merge_local(local);
+
+        assert_eq!(config.services.len(), 3);
+        assert!(config.services.iter().any(|s| s.name == "Migrate"
+            && s.command == "different-service"));
+        assert_eq!(config.commands.len(), 1);
+        assert_eq!(config.commands[0].command, "migrate-v2");
     }
 }
