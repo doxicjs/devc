@@ -52,6 +52,7 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 - **Status messages** — flash for 3 seconds then disappear
 - **Startup tab** — opens on the Services tab
 - **Sections** — all sections are optional including `services`; unknown fields are rejected with a clear error
+- **Local overrides** — if a sibling `devc.local.toml` exists, it's merged on top of `devc.toml` at startup (see below)
 
 ### Configuration
 
@@ -131,3 +132,45 @@ text = "your-api-key"
 | `name` | yes      | Display name                            |
 | `key`  | yes      | Single-character shortcut to copy       |
 | `text` | yes      | Text to copy to clipboard               |
+
+### Local Overrides
+
+Drop a `devc.local.toml` next to your `devc.toml` to add personal services, commands, or tools without touching the shared config. At startup devc merges it on top of the main config — new entries are appended, and entries whose `name` matches a shared entry replace it in place.
+
+```toml
+# devc.local.toml
+[[services]]
+name = "Scratch"
+key = "s"
+command = "pnpm dev:scratch"
+working_dir = "scratch"
+service_type = "backend"
+
+[[services]]
+name = "Web"                      # same name as in devc.toml — overrides
+key = "w"
+command = "pnpm dev --inspect"
+working_dir = "web"
+service_type = "frontend"
+port = 5173
+
+[[links]]
+name = "Local Admin"
+key = "l"
+url = "http://localhost:9000/admin"
+```
+
+Add it to your project's `.gitignore`:
+
+```
+devc.local.toml
+```
+
+**Rules:**
+
+- Filename is derived from the main config: `devc.toml` → `devc.local.toml`, `foo.config.toml` → `foo.config.local.toml`
+- Every section in `devc.local.toml` is optional, including `[[services]]`
+- `services`, `commands`, `links`, `copies` merge **by `name`** — same name replaces in place; new name appends
+- `[general]` merges field-by-field (only fields set in local override main)
+- Missing local file is silent; malformed local TOML fails loud at startup
+- Gotcha: if you rename an entry in the shared `devc.toml`, any local override keyed on the old `name` will silently become an additive orphan entry — rename it in your local file too
