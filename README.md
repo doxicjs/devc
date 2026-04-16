@@ -55,6 +55,10 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 - **Local overrides** — if a sibling `devc.local.toml` exists, it's merged on top of `devc.toml` at startup (see below)
 - **Live config reload** — `devc.toml` and `devc.local.toml` are polled (~100ms via mtime). Edits reload automatically without restarting devc; running services are never killed. A `[reload]` (yellow) badge appears on a running service or command whose config changed — stop+start to apply. A `[removed]` (red) badge appears on a running entry that was removed from config — once stopped, it auto-disappears. Stopped commands are fully reset (logs cleared, status icon gone) when their config changes. Tools (links, copies) rebuild silently. Parse errors flash an error and keep the previous config active.
 
+### Upgrading
+
+See [MIGRATION.md](MIGRATION.md) for breaking changes between releases.
+
 ### Configuration
 
 ```toml
