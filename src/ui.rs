@@ -108,12 +108,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     // Render tabs and status on the same line.
     // When a transient status flash is active, it takes the right slot;
     // otherwise the persistent N/M running count is shown.
-    let right_text = if let Some((msg, _)) = &app.status {
+    let right_text = if let Some(msg) = app.status.current() {
         format!(" {} ", msg)
     } else {
         format!(" {}/{} running ", running, total)
     };
-    let right_color = if app.status.is_some() || running > 0 {
+    let right_color = if app.status.current().is_some() || running > 0 {
         Color::Green
     } else {
         Color::DarkGray

@@ -3,6 +3,7 @@ mod config;
 mod id;
 mod platform;
 mod process;
+mod status;
 mod ui;
 
 use std::io;
@@ -141,7 +142,7 @@ fn run(
         app.poll_logs();
         app.check_processes();
         app.check_ports();
-        app.clear_old_status();
+        app.status.clear_if_expired();
 
         terminal.draw(|f| ui::draw(f, app))?;
 

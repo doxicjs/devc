@@ -10,14 +10,13 @@ const LOG_CAPACITY: usize = 500;
 const PORT_CHECK_INTERVAL: u64 = 20;
 /// Seconds to wait after SIGTERM before escalating to SIGKILL.
 const KILL_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long status messages stay visible.
-const STATUS_TTL: Duration = Duration::from_secs(3);
 
 use crate::config::Config;
 use crate::config::ServiceConfig;
 use crate::config::CommandConfig;
 use crate::id::{CommandId, ServiceId};
 use crate::process::ProcessHandle;
+use crate::status::StatusBar;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceStatus {
@@ -135,7 +134,7 @@ pub struct App {
     pub tab: Tab,
     pub tools: Vec<ToolItem>,
     pub tools_selected: usize,
-    pub status: Option<(String, Instant)>,
+    pub status: StatusBar,
     pub tick: u64,
     next_service_id: u64,
     next_command_id: u64,
@@ -238,7 +237,7 @@ impl App {
             tab: Tab::Services,
             tools,
             tools_selected: 0,
-            status: None,
+            status: StatusBar::new(),
             tick: 0,
             next_service_id,
             next_command_id,
@@ -469,12 +468,12 @@ impl App {
             return;
         };
         let Some(url) = service.config.open_url() else {
-            self.set_status("No URL for this service".to_string());
+            self.status.set("No URL for this service".to_string());
             return;
         };
         match crate::platform::open_url(&url) {
-            Ok(_) => self.set_status(format!("Opened: {}", url)),
-            Err(e) => self.set_status(format!("Error: {}", e)),
+            Ok(_) => self.status.set(format!("Opened: {}", url)),
+            Err(e) => self.status.set(format!("Error: {}", e)),
         }
     }
 
@@ -575,16 +574,16 @@ impl App {
             ToolKind::Link(url) => {
                 let url = url.clone();
                 match crate::platform::open_url(&url) {
-                    Ok(_) => self.set_status(format!("Opened: {}", url)),
-                    Err(e) => self.set_status(format!("Error: {}", e)),
+                    Ok(_) => self.status.set(format!("Opened: {}", url)),
+                    Err(e) => self.status.set(format!("Error: {}", e)),
                 }
             }
             ToolKind::Copy(text) => {
                 let text = text.clone();
                 let name = tool.name.clone();
                 match crate::platform::copy_to_clipboard(&text) {
-                    Ok(_) => self.set_status(format!("Copied: {}", name)),
-                    Err(e) => self.set_status(format!("Error: {}", e)),
+                    Ok(_) => self.status.set(format!("Copied: {}", name)),
+                    Err(e) => self.status.set(format!("Error: {}", e)),
                 }
             }
         }
@@ -610,20 +609,6 @@ impl App {
                 if let Some(idx) = self.find_tool_by_key(c) {
                     self.activate_tool(idx);
                 }
-            }
-        }
-    }
-
-    // --- Status ---
-
-    fn set_status(&mut self, msg: String) {
-        self.status = Some((msg, Instant::now()));
-    }
-
-    pub fn clear_old_status(&mut self) {
-        if let Some((_, ts)) = &self.status {
-            if ts.elapsed() > STATUS_TTL {
-                self.status = None;
             }
         }
     }
@@ -828,7 +813,7 @@ impl App {
                 // Missing or unreadable. Tolerate up to 3 consecutive ticks (atomic-rename window).
                 self.reload_fail_count = self.reload_fail_count.saturating_add(1);
                 if self.reload_fail_count == 3 {
-                    self.set_status("config file missing".to_string());
+                    self.status.set("config file missing".to_string());
                 }
                 return;
             }
@@ -865,13 +850,13 @@ impl App {
                 self.local_mtime = local_mtime;
                 self.reload_pending_since = None;
                 let report = self.apply_config(new_cfg);
-                self.set_status(report.summary());
+                self.status.set(report.summary());
             }
             Err(e) => {
                 self.reload_pending_since = None;
                 // Leave stored mtimes unchanged so a subsequent edit (which will bump mtime
                 // again) re-triggers a reload attempt.
-                self.set_status(format!("config reload failed: {}", e));
+                self.status.set(format!("config reload failed: {}", e));
             }
         }
     }
@@ -1412,19 +1397,18 @@ mod tests {
     // ===== Status =====
 
     #[test]
-    fn clear_old_status_removes_expired() {
+    fn status_set_and_current() {
         let mut app = empty_app();
-        app.status = Some(("test".to_string(), Instant::now() - Duration::from_secs(4)));
-        app.clear_old_status();
-        assert!(app.status.is_none());
+        app.status.set("test".to_string());
+        assert_eq!(app.status.current(), Some("test"));
     }
 
     #[test]
-    fn clear_old_status_keeps_recent() {
+    fn status_clear_if_expired_keeps_fresh() {
         let mut app = empty_app();
-        app.status = Some(("test".to_string(), Instant::now()));
-        app.clear_old_status();
-        assert!(app.status.is_some());
+        app.status.set("test".to_string());
+        app.status.clear_if_expired();
+        assert_eq!(app.status.current(), Some("test"));
     }
 
     // ===== open_service_url =====
