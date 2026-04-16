@@ -75,10 +75,10 @@ pub struct ToolItem {
     pub kind: ToolKind,
 }
 
-/// Log messages are tagged with a source: Service(idx) or Command(idx)
+/// Log messages are tagged with a source: Service(id) or Command(id)
 pub enum LogSource {
-    Service(usize),
-    Command(usize),
+    Service(ServiceId),
+    Command(CommandId),
 }
 
 #[derive(Debug, Default)]
@@ -442,11 +442,12 @@ impl App {
             .logs
             .push_back(format!("── starting: {} ──", cmd));
 
+        let service_id = service.id;
         match ProcessHandle::spawn(
             &cmd,
             working_dir.to_str().unwrap_or("."),
             self.log_sender.clone(),
-            idx,
+            move || LogSource::Service(service_id),
         )
         {
             Ok(handle) => {
@@ -531,14 +532,13 @@ impl App {
             .push_back(format!("── running: {} ──", cmd));
 
         let sender = self.log_sender.clone();
-        let cmd_idx = idx;
+        let cmd_id = cmd_state.id;
 
-        match ProcessHandle::spawn_tagged(
+        match ProcessHandle::spawn(
             &cmd,
             working_dir.to_str().unwrap_or("."),
             sender,
-            cmd_idx,
-            true,
+            move || LogSource::Command(cmd_id),
         ) {
             Ok(handle) => {
                 cmd_state.process = Some(handle);
@@ -637,16 +637,16 @@ impl App {
     pub fn poll_logs(&mut self) {
         while let Ok((source, line)) = self.log_receiver.try_recv() {
             match source {
-                LogSource::Service(idx) => {
-                    if let Some(service) = self.services.get_mut(idx) {
+                LogSource::Service(id) => {
+                    if let Some(service) = self.services.iter_mut().find(|s| s.id == id) {
                         service.logs.push_back(line);
                         if service.logs.len() > LOG_CAPACITY {
                             service.logs.pop_front();
                         }
                     }
                 }
-                LogSource::Command(idx) => {
-                    if let Some(cmd) = self.commands.get_mut(idx) {
+                LogSource::Command(id) => {
+                    if let Some(cmd) = self.commands.iter_mut().find(|c| c.id == id) {
                         cmd.logs.push_back(line);
                         if cmd.logs.len() > LOG_CAPACITY {
                             cmd.logs.pop_front();
@@ -780,8 +780,9 @@ impl App {
     /// Tail-compact services and commands whose `orphan` flag is set and that have
     /// fully stopped (no process, status Stopped/Idle/Done/Failed). Called every tick
     /// so an orphan disappears as soon as the user stops it — no config-edit nudge needed.
-    /// Tail-only to preserve indices for any still-running entries (background threads
-    /// hard-code their LogSource index at spawn time).
+    /// Tail-only: entries at the head may still have live background threads; those
+    /// threads carry a stable typed ID so they can route logs correctly even if the
+    /// slice index shifts — but we still avoid disturbing them to keep things simple.
     pub fn compact_stopped_orphans(&mut self) {
         while let Some(s) = self.services.last() {
             if s.orphan && s.status == ServiceStatus::Stopped && s.process.is_none() {
@@ -902,8 +903,8 @@ impl App {
                 svc_drop[i] = true;
             }
         }
-        // Tail-compact: only safe to remove from the end (preserves indices for any
-        // running service still referenced by a background-thread LogSource).
+        // Tail-compact: only safe to remove from the end (background threads carry
+        // typed IDs but we keep the tail-compact invariant for simplicity).
         while let Some(true) = svc_drop.last().copied() {
             self.services.pop();
             svc_drop.pop();
@@ -1104,6 +1105,7 @@ fn detect_key_conflicts(
 mod tests {
     use super::*;
     use crate::config::*;
+    use crate::id::{CommandId, ServiceId};
     use std::path::PathBuf;
 
     fn svc(name: &str, key: &str, port: Option<u16>) -> ServiceConfig {
@@ -1449,14 +1451,14 @@ mod tests {
     #[test]
     fn poll_logs_invalid_service_index_no_panic() {
         let mut app = empty_app();
-        let _ = app.log_sender.send((LogSource::Service(999), "ghost".to_string()));
+        let _ = app.log_sender.send((LogSource::Service(ServiceId(999)), "ghost".to_string()));
         app.poll_logs();
     }
 
     #[test]
     fn poll_logs_invalid_command_index_no_panic() {
         let mut app = empty_app();
-        let _ = app.log_sender.send((LogSource::Command(999), "ghost".to_string()));
+        let _ = app.log_sender.send((LogSource::Command(CommandId(999)), "ghost".to_string()));
         app.poll_logs();
     }
 
@@ -1465,8 +1467,9 @@ mod tests {
     #[test]
     fn service_logs_capped_at_500() {
         let mut app = app_with(vec![svc("web", "w", None)], vec![]);
+        let svc_id = app.services[0].id;
         for i in 0..600 {
-            let _ = app.log_sender.send((LogSource::Service(0), format!("line {}", i)));
+            let _ = app.log_sender.send((LogSource::Service(svc_id), format!("line {}", i)));
         }
         app.poll_logs();
         assert_eq!(app.services[0].logs.len(), 500);
@@ -1477,8 +1480,9 @@ mod tests {
     #[test]
     fn command_logs_capped_at_500() {
         let mut app = app_with(vec![], vec![cmd("build", "b", "echo b")]);
+        let cmd_id = app.commands[0].id;
         for i in 0..600 {
-            let _ = app.log_sender.send((LogSource::Command(0), format!("line {}", i)));
+            let _ = app.log_sender.send((LogSource::Command(cmd_id), format!("line {}", i)));
         }
         app.poll_logs();
         assert_eq!(app.commands[0].logs.len(), 500);
@@ -1526,9 +1530,10 @@ mod tests {
     #[test]
     fn scroll_up_clamped_to_log_length() {
         let mut app = app_with(vec![svc("web", "w", None)], vec![]);
+        let svc_id = app.services[0].id;
         // Add 10 log lines
         for i in 0..10 {
-            let _ = app.log_sender.send((LogSource::Service(0), format!("line {}", i)));
+            let _ = app.log_sender.send((LogSource::Service(svc_id), format!("line {}", i)));
         }
         app.poll_logs();
         // Scroll up way past the log length
@@ -1726,9 +1731,10 @@ mod planned_api_tests {
     #[test]
     fn scroll_up_increases_offset() {
         let mut app = app_with(vec![svc("web", "w")], vec![]);
+        let svc_id = app.services[0].id;
         // Add log lines so scroll has room
         for i in 0..20 {
-            let _ = app.log_sender.send((LogSource::Service(0), format!("line {}", i)));
+            let _ = app.log_sender.send((LogSource::Service(svc_id), format!("line {}", i)));
         }
         app.poll_logs();
         assert_eq!(app.log_scroll_offset, 0);
@@ -1765,9 +1771,10 @@ mod planned_api_tests {
     #[test]
     fn scroll_up_commands_tab_uses_cmd_offset() {
         let mut app = app_with(vec![], vec![cmd("build", "b")]);
+        let cmd_id = app.commands[0].id;
         // Add log lines so scroll has room
         for i in 0..20 {
-            let _ = app.log_sender.send((LogSource::Command(0), format!("line {}", i)));
+            let _ = app.log_sender.send((LogSource::Command(cmd_id), format!("line {}", i)));
         }
         app.poll_logs();
         app.tab = Tab::Commands;
@@ -1908,15 +1915,16 @@ mod planned_api_tests {
     #[test]
     fn apply_config_running_service_log_routing_index_unchanged() {
         // Old: [API=0(running), Web=1(stopped)]
-        // New config drops Web and adds Worker → API stays at idx 0 (orphan would be Web, but Web is stopped and removed; API kept)
+        // New config drops Web and adds Worker → API is still found by its stable ID
         let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        let api_id = app.services[0].id;
         app.services[0].status = ServiceStatus::Running;
         let new = config_with(vec![svc("API", "a"), svc("Worker", "k")], vec![], vec![], vec![]);
         app.apply_config(new);
-        // API must still be at index 0 (its background thread sends LogSource::Service(0))
+        // API must still be findable by its stable typed ID
         assert_eq!(app.services[0].config.name, "API");
-        // Send a log on idx 0 and verify it lands in API's buffer
-        let _ = app.log_sender.send((LogSource::Service(0), "API log line".to_string()));
+        // Send a log with API's typed ID and verify it lands in API's buffer
+        let _ = app.log_sender.send((LogSource::Service(api_id), "API log line".to_string()));
         app.poll_logs();
         assert!(app.services[0].logs.iter().any(|l| l.contains("API log line")));
     }

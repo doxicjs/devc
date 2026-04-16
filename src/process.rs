@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -12,25 +12,21 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
-    pub fn spawn(
-        command: &str,
-        working_dir: &str,
-        log_sender: mpsc::Sender<(LogSource, String)>,
-        service_idx: usize,
-    ) -> Result<Self, String> {
-        Self::spawn_tagged(command, working_dir, log_sender, service_idx, false)
-    }
-
-    /// Spawn a command in a new process group so we can kill the entire group.
+    /// Spawn a command in a new process group. `tag` is invoked each time a
+    /// log line is read, producing the `LogSource` the caller wants attached.
+    /// This is where the caller injects its typed ID.
+    ///
     /// Note: processes that call setsid() will escape the group and won't be
     /// killed on cleanup. This is a fundamental Unix limitation.
-    pub fn spawn_tagged(
+    pub fn spawn<F>(
         command: &str,
         working_dir: &str,
         log_sender: mpsc::Sender<(LogSource, String)>,
-        idx: usize,
-        is_command: bool,
-    ) -> Result<Self, String> {
+        tag: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn() -> LogSource + Send + Clone + 'static,
+    {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(command)
@@ -43,65 +39,11 @@ impl ProcessHandle {
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         let pid = child.id() as i32;
 
-        let make_source = move |i: usize| -> LogSource {
-            if is_command {
-                LogSource::Command(i)
-            } else {
-                LogSource::Service(i)
-            }
-        };
-
         if let Some(stdout) = child.stdout.take() {
-            let sender = log_sender.clone();
-            thread::spawn(move || {
-                let mut reader = BufReader::new(stdout);
-                let mut buf = Vec::new();
-                loop {
-                    buf.clear();
-                    match reader.read_until(b'\n', &mut buf) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let line = String::from_utf8_lossy(&buf)
-                                .trim_end_matches(&['\r', '\n'][..])
-                                .to_string();
-                            if sender.send((make_source(idx), line)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
+            spawn_reader(stdout, log_sender.clone(), tag.clone());
         }
-
         if let Some(stderr) = child.stderr.take() {
-            let sender = log_sender;
-            let make_source2 = move |i: usize| -> LogSource {
-                if is_command {
-                    LogSource::Command(i)
-                } else {
-                    LogSource::Service(i)
-                }
-            };
-            thread::spawn(move || {
-                let mut reader = BufReader::new(stderr);
-                let mut buf = Vec::new();
-                loop {
-                    buf.clear();
-                    match reader.read_until(b'\n', &mut buf) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let line = String::from_utf8_lossy(&buf)
-                                .trim_end_matches(&['\r', '\n'][..])
-                                .to_string();
-                            if sender.send((make_source2(idx), line)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
+            spawn_reader(stderr, log_sender, tag);
         }
 
         Ok(Self { child, pid })
@@ -148,9 +90,39 @@ impl ProcessHandle {
     }
 }
 
+fn spawn_reader<R, F>(
+    stream: R,
+    sender: mpsc::Sender<(LogSource, String)>,
+    tag: F,
+) where
+    R: Read + Send + 'static,
+    F: Fn() -> LogSource + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf)
+                        .trim_end_matches(&['\r', '\n'][..])
+                        .to_string();
+                    if sender.send((tag(), line)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::{CommandId, ServiceId};
     use std::time::{Duration, Instant};
 
     // ===== Basic spawn and output collection =====
@@ -158,7 +130,7 @@ mod tests {
     #[test]
     fn spawn_and_collect_stdout() {
         let (tx, rx) = mpsc::channel();
-        let _handle = ProcessHandle::spawn("echo hello", ".", tx, 0).unwrap();
+        let _handle = ProcessHandle::spawn("echo hello", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         let mut lines = Vec::new();
@@ -173,7 +145,7 @@ mod tests {
     #[test]
     fn spawn_and_collect_stderr() {
         let (tx, rx) = mpsc::channel();
-        let _handle = ProcessHandle::spawn("echo error >&2", ".", tx, 0).unwrap();
+        let _handle = ProcessHandle::spawn("echo error >&2", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         let mut lines = Vec::new();
@@ -188,12 +160,12 @@ mod tests {
     #[test]
     fn spawn_tags_as_service_by_default() {
         let (tx, rx) = mpsc::channel();
-        let _handle = ProcessHandle::spawn("echo test", ".", tx, 42).unwrap();
+        let _handle = ProcessHandle::spawn("echo test", ".", tx, || LogSource::Service(ServiceId(42))).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         if let Ok((source, _)) = rx.try_recv() {
             match source {
-                LogSource::Service(idx) => assert_eq!(idx, 42),
+                LogSource::Service(id) => assert_eq!(id, ServiceId(42)),
                 LogSource::Command(_) => panic!("Expected Service tag, got Command"),
             }
         }
@@ -202,12 +174,12 @@ mod tests {
     #[test]
     fn spawn_tagged_as_command() {
         let (tx, rx) = mpsc::channel();
-        let _handle = ProcessHandle::spawn_tagged("echo test", ".", tx, 7, true).unwrap();
+        let _handle = ProcessHandle::spawn("echo test", ".", tx, || LogSource::Command(CommandId(7))).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         if let Ok((source, _)) = rx.try_recv() {
             match source {
-                LogSource::Command(idx) => assert_eq!(idx, 7),
+                LogSource::Command(id) => assert_eq!(id, CommandId(7)),
                 LogSource::Service(_) => panic!("Expected Command tag, got Service"),
             }
         }
@@ -217,7 +189,7 @@ mod tests {
     fn multiline_output_preserves_all_lines() {
         let (tx, rx) = mpsc::channel();
         let _handle =
-            ProcessHandle::spawn("printf 'line1\\nline2\\nline3\\n'", ".", tx, 0).unwrap();
+            ProcessHandle::spawn("printf 'line1\\nline2\\nline3\\n'", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         let mut lines = Vec::new();
@@ -241,7 +213,7 @@ mod tests {
         // because 0xFF is invalid UTF-8.
         // Expected: line is preserved with replacement character via lossy conversion.
         let _handle =
-            ProcessHandle::spawn("printf '\\xff hello\\n'", ".", tx, 0).unwrap();
+            ProcessHandle::spawn("printf '\\xff hello\\n'", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         let mut lines = Vec::new();
@@ -266,7 +238,7 @@ mod tests {
     #[test]
     fn crlf_line_endings_stripped() {
         let (tx, rx) = mpsc::channel();
-        let _handle = ProcessHandle::spawn("printf 'hello\\r\\n'", ".", tx, 0).unwrap();
+        let _handle = ProcessHandle::spawn("printf 'hello\\r\\n'", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         let mut lines = Vec::new();
@@ -287,7 +259,7 @@ mod tests {
     #[test]
     fn is_running_true_for_active_process() {
         let (tx, _rx) = mpsc::channel();
-        let mut handle = ProcessHandle::spawn("sleep 10", ".", tx, 0).unwrap();
+        let mut handle = ProcessHandle::spawn("sleep 10", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         assert!(handle.is_running());
         handle.kill();
     }
@@ -295,7 +267,7 @@ mod tests {
     #[test]
     fn is_running_false_after_exit() {
         let (tx, _rx) = mpsc::channel();
-        let mut handle = ProcessHandle::spawn("true", ".", tx, 0).unwrap();
+        let mut handle = ProcessHandle::spawn("true", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(!handle.is_running());
     }
@@ -303,7 +275,7 @@ mod tests {
     #[test]
     fn exit_code_zero_on_success() {
         let (tx, _rx) = mpsc::channel();
-        let mut handle = ProcessHandle::spawn("true", ".", tx, 0).unwrap();
+        let mut handle = ProcessHandle::spawn("true", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(handle.exit_code(), Some(0));
     }
@@ -311,7 +283,7 @@ mod tests {
     #[test]
     fn exit_code_nonzero_on_failure() {
         let (tx, _rx) = mpsc::channel();
-        let mut handle = ProcessHandle::spawn("false", ".", tx, 0).unwrap();
+        let mut handle = ProcessHandle::spawn("false", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(handle.exit_code(), Some(1));
     }
@@ -319,7 +291,7 @@ mod tests {
     #[test]
     fn kill_terminates_running_process() {
         let (tx, _rx) = mpsc::channel();
-        let mut handle = ProcessHandle::spawn("sleep 100", ".", tx, 0).unwrap();
+        let mut handle = ProcessHandle::spawn("sleep 100", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         assert!(handle.is_running());
         handle.kill();
         assert!(!handle.is_running());
@@ -328,7 +300,7 @@ mod tests {
     #[test]
     fn kill_handles_already_exited_process() {
         let (tx, _rx) = mpsc::channel();
-        let mut handle = ProcessHandle::spawn("true", ".", tx, 0).unwrap();
+        let mut handle = ProcessHandle::spawn("true", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         handle.kill(); // should not panic
     }
@@ -345,7 +317,7 @@ mod tests {
             "trap 'exit 0' TERM; sleep 100 & wait",
             ".",
             tx,
-            0,
+            || LogSource::Service(ServiceId(0)),
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(200));
@@ -365,7 +337,7 @@ mod tests {
     #[test]
     fn spawn_with_invalid_working_dir_fails() {
         let (tx, _rx) = mpsc::channel();
-        let result = ProcessHandle::spawn("echo hi", "/nonexistent/dir/xyz", tx, 0);
+        let result = ProcessHandle::spawn("echo hi", "/nonexistent/dir/xyz", tx, || LogSource::Service(ServiceId(0)));
         assert!(result.is_err(), "Should fail with invalid working directory");
     }
 
@@ -375,7 +347,7 @@ mod tests {
     fn spawn_empty_command() {
         let (tx, _rx) = mpsc::channel();
         // sh -c "" exits immediately with 0
-        let mut handle = ProcessHandle::spawn("", ".", tx, 0).unwrap();
+        let mut handle = ProcessHandle::spawn("", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(!handle.is_running());
         assert_eq!(handle.exit_code(), Some(0));
