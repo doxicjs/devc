@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Max lines kept per service/command log buffer (oldest evicted first).
 const LOG_CAPACITY: usize = 500;
@@ -33,6 +33,8 @@ pub struct ServiceState {
     pub port_active: bool,
     pub stopping_since: Option<Instant>,
     pub logs: VecDeque<String>,
+    pub config_dirty: bool,
+    pub orphan: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +50,8 @@ pub struct CommandState {
     pub process: Option<ProcessHandle>,
     pub status: CommandStatus,
     pub logs: VecDeque<String>,
+    pub config_dirty: bool,
+    pub orphan: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +78,52 @@ pub enum LogSource {
     Command(usize),
 }
 
+#[derive(Debug, Default)]
+pub struct ReloadReport {
+    pub services_added: usize,
+    pub services_dropped: usize,
+    pub services_pending_restart: usize,
+    pub services_orphaned: usize,
+    pub commands_added: usize,
+    pub commands_dropped: usize,
+    pub commands_pending_restart: usize,
+    pub commands_orphaned: usize,
+    pub project_root_changed: bool,
+    pub key_conflicts: Vec<String>,
+}
+
+impl ReloadReport {
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let added = self.services_added + self.commands_added;
+        if added > 0 {
+            parts.push(format!("+{}", added));
+        }
+        let dropped = self.services_dropped + self.commands_dropped;
+        if dropped > 0 {
+            parts.push(format!("-{}", dropped));
+        }
+        let dirty = self.services_pending_restart
+            + self.commands_pending_restart
+            + self.services_orphaned
+            + self.commands_orphaned;
+        if dirty > 0 {
+            parts.push(format!("{} reload needed", dirty));
+        }
+        if self.project_root_changed {
+            parts.push("project_root pending".to_string());
+        }
+        if !self.key_conflicts.is_empty() {
+            parts.push(format!("{} key conflict{}", self.key_conflicts.len(), if self.key_conflicts.len() == 1 { "" } else { "s" }));
+        }
+        if parts.is_empty() {
+            "config reloaded".to_string()
+        } else {
+            format!("reloaded · {}", parts.join(" · "))
+        }
+    }
+}
+
 pub struct App {
     pub services: Vec<ServiceState>,
     pub commands: Vec<CommandState>,
@@ -89,12 +139,24 @@ pub struct App {
     port_sender: mpsc::Sender<(usize, bool)>,
     port_receiver: mpsc::Receiver<(usize, bool)>,
     project_root: PathBuf,
+    config_dir: PathBuf,
+    config_path: PathBuf,
+    local_config_path: Option<PathBuf>,
+    config_mtime: Option<SystemTime>,
+    local_mtime: Option<SystemTime>,
+    reload_pending_since: Option<Instant>,
+    reload_fail_count: u8,
     pub log_scroll_offset: usize,
     pub cmd_log_scroll_offset: usize,
 }
 
 impl App {
-    pub fn new(config: Config, config_dir: PathBuf) -> Self {
+    pub fn new(
+        config: Config,
+        config_dir: PathBuf,
+        config_path: PathBuf,
+        local_config_path: Option<PathBuf>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let (port_tx, port_rx) = mpsc::channel();
         let project_root = config_dir.join(&config.general.project_root);
@@ -109,6 +171,8 @@ impl App {
                 port_active: false,
                 stopping_since: None,
                 logs: VecDeque::with_capacity(LOG_CAPACITY),
+                config_dirty: false,
+                orphan: false,
             })
             .collect();
 
@@ -120,6 +184,8 @@ impl App {
                 process: None,
                 status: CommandStatus::Idle,
                 logs: VecDeque::with_capacity(LOG_CAPACITY),
+                config_dirty: false,
+                orphan: false,
             })
             .collect();
 
@@ -139,48 +205,15 @@ impl App {
             });
         }
 
-        {
-            let reserved = ['a', 'x'];
-            let mut seen = Vec::<char>::new();
-            for s in services.iter() {
-                let k = s.config.key_char().to_ascii_lowercase();
-                if k == 'q' {
-                    eprintln!("warning: service '{}' key '{}' conflicts with quit", s.config.name, k);
-                }
-                if reserved.contains(&k) {
-                    eprintln!("warning: service '{}' key '{}' conflicts with reserved shortcut", s.config.name, k);
-                }
-                if seen.contains(&k) {
-                    eprintln!("warning: duplicate service key '{}'", k);
-                } else {
-                    seen.push(k);
-                }
-            }
-            seen.clear();
-            for c in commands.iter() {
-                let k = c.config.key_char().to_ascii_lowercase();
-                if k == 'q' {
-                    eprintln!("warning: command '{}' key '{}' conflicts with quit", c.config.name, k);
-                }
-                if seen.contains(&k) {
-                    eprintln!("warning: duplicate command key '{}'", k);
-                } else {
-                    seen.push(k);
-                }
-            }
-            seen.clear();
-            for t in tools.iter() {
-                let k = t.key.to_ascii_lowercase();
-                if k == 'q' {
-                    eprintln!("warning: tool '{}' key '{}' conflicts with quit", t.name, k);
-                }
-                if seen.contains(&k) {
-                    eprintln!("warning: duplicate tool key '{}'", k);
-                } else {
-                    seen.push(k);
-                }
-            }
+        for warning in detect_key_conflicts(&services, &commands, &tools) {
+            eprintln!("warning: {}", warning);
         }
+
+        fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
+            std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+        }
+        let config_mtime = file_mtime(&config_path);
+        let local_mtime = local_config_path.as_ref().and_then(|p| file_mtime(p));
 
         Self {
             services,
@@ -197,6 +230,13 @@ impl App {
             port_sender: port_tx,
             port_receiver: port_rx,
             project_root,
+            config_dir,
+            config_path,
+            local_config_path,
+            config_mtime,
+            local_mtime,
+            reload_pending_since: None,
+            reload_fail_count: 0,
             log_scroll_offset: 0,
             cmd_log_scroll_offset: 0,
         }
@@ -377,6 +417,7 @@ impl App {
         }
 
         service.status = ServiceStatus::Starting;
+        service.config_dirty = false;
 
         let working_dir = self.project_root.join(&service.config.working_dir);
         let cmd = service.config.full_command();
@@ -464,6 +505,7 @@ impl App {
         let cmd_state = &mut self.commands[idx];
         cmd_state.logs.clear();
         cmd_state.status = CommandStatus::Running;
+        cmd_state.config_dirty = false;
 
         let working_dir = self.project_root.join(&cmd_state.config.working_dir);
         let cmd = cmd_state.config.command.clone();
@@ -717,6 +759,322 @@ impl App {
             }
         }
     }
+
+    /// Tail-compact services and commands whose `orphan` flag is set and that have
+    /// fully stopped (no process, status Stopped/Idle/Done/Failed). Called every tick
+    /// so an orphan disappears as soon as the user stops it — no config-edit nudge needed.
+    /// Tail-only to preserve indices for any still-running entries (background threads
+    /// hard-code their LogSource index at spawn time).
+    pub fn compact_stopped_orphans(&mut self) {
+        while let Some(s) = self.services.last() {
+            if s.orphan && s.status == ServiceStatus::Stopped && s.process.is_none() {
+                self.services.pop();
+            } else {
+                break;
+            }
+        }
+        if self.services.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.services.len() {
+            self.selected = self.services.len() - 1;
+        }
+        while let Some(c) = self.commands.last() {
+            if c.orphan && c.status != CommandStatus::Running && c.process.is_none() {
+                self.commands.pop();
+            } else {
+                break;
+            }
+        }
+        if self.commands.is_empty() {
+            self.commands_selected = 0;
+        } else if self.commands_selected >= self.commands.len() {
+            self.commands_selected = self.commands.len() - 1;
+        }
+    }
+
+    pub fn check_config_reload(&mut self) {
+        fn file_mtime(path: &std::path::Path) -> Result<Option<SystemTime>, std::io::Error> {
+            match std::fs::metadata(path) {
+                Ok(m) => Ok(m.modified().ok()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+
+        let main_mtime = match file_mtime(&self.config_path) {
+            Ok(Some(m)) => {
+                self.reload_fail_count = 0;
+                Some(m)
+            }
+            Ok(None) | Err(_) => {
+                // Missing or unreadable. Tolerate up to 3 consecutive ticks (atomic-rename window).
+                self.reload_fail_count = self.reload_fail_count.saturating_add(1);
+                if self.reload_fail_count == 3 {
+                    self.set_status("config file missing".to_string());
+                }
+                return;
+            }
+        };
+
+        let local_mtime = match self.local_config_path.as_ref() {
+            Some(p) => file_mtime(p).unwrap_or(None),
+            None => None,
+        };
+
+        let main_changed = main_mtime != self.config_mtime;
+        let local_changed = local_mtime != self.local_mtime;
+
+        if !main_changed && !local_changed && self.reload_pending_since.is_none() {
+            return;
+        }
+
+        // First detection: start debounce window (~100ms = one more tick).
+        if self.reload_pending_since.is_none() {
+            self.reload_pending_since = Some(Instant::now());
+            return;
+        }
+
+        // Wait until debounce elapses.
+        if self.reload_pending_since.unwrap().elapsed() < Duration::from_millis(100) {
+            return;
+        }
+
+        // Time to reload.
+        let local_path = self.local_config_path.clone();
+        match crate::config::Config::load(&self.config_path, local_path.as_deref()) {
+            Ok(new_cfg) => {
+                self.config_mtime = main_mtime;
+                self.local_mtime = local_mtime;
+                self.reload_pending_since = None;
+                let report = self.apply_config(new_cfg);
+                self.set_status(report.summary());
+            }
+            Err(e) => {
+                self.reload_pending_since = None;
+                // Leave stored mtimes unchanged so a subsequent edit (which will bump mtime
+                // again) re-triggers a reload attempt.
+                self.set_status(format!("config reload failed: {}", e));
+            }
+        }
+    }
+
+    pub fn apply_config(&mut self, new: Config) -> ReloadReport {
+        let mut report = ReloadReport::default();
+
+        // ----- Services -----
+        // Update kept; mark removed-but-running as orphan (dirty); mark removed-and-stopped for drop.
+        let mut svc_drop: Vec<bool> = vec![false; self.services.len()];
+        for (i, state) in self.services.iter_mut().enumerate() {
+            if let Some(new_cfg) = new.services.iter().find(|s| s.name == state.config.name) {
+                let changed = service_config_changed(&state.config, new_cfg);
+                state.config = new_cfg.clone();
+                state.orphan = false;
+                if state.status != ServiceStatus::Stopped {
+                    if changed {
+                        state.config_dirty = true;
+                        report.services_pending_restart += 1;
+                    }
+                } else {
+                    state.config_dirty = false;
+                }
+            } else if state.status != ServiceStatus::Stopped || state.process.is_some() {
+                state.orphan = true;
+                state.config_dirty = true;
+                report.services_orphaned += 1;
+            } else {
+                svc_drop[i] = true;
+            }
+        }
+        // Tail-compact: only safe to remove from the end (preserves indices for any
+        // running service still referenced by a background-thread LogSource).
+        while let Some(true) = svc_drop.last().copied() {
+            self.services.pop();
+            svc_drop.pop();
+            report.services_dropped += 1;
+        }
+
+        // Append new
+        for cfg in new.services.iter() {
+            let exists = self.services.iter().any(|s| s.config.name == cfg.name);
+            if !exists {
+                self.services.push(ServiceState {
+                    config: cfg.clone(),
+                    process: None,
+                    status: ServiceStatus::Stopped,
+                    port_active: false,
+                    stopping_since: None,
+                    logs: VecDeque::with_capacity(LOG_CAPACITY),
+                    config_dirty: false,
+                    orphan: false,
+                });
+                report.services_added += 1;
+            }
+        }
+
+        // Clamp selection if tail-compact shrunk the list.
+        if self.services.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.services.len() {
+            self.selected = self.services.len() - 1;
+        }
+
+        // ----- Commands -----
+        // Kept+not-running → fully replace state (logs cleared, status reset).
+        // Kept+running → keep state; set dirty if changed.
+        // Removed+running → orphan (dirty).
+        // Removed+stopped → mark for tail-compact drop.
+        let mut cmd_drop: Vec<bool> = vec![false; self.commands.len()];
+        for (i, state) in self.commands.iter_mut().enumerate() {
+            if let Some(new_cfg) = new.commands.iter().find(|c| c.name == state.config.name) {
+                let changed = command_config_changed(&state.config, new_cfg);
+                if state.status == CommandStatus::Running {
+                    state.config = new_cfg.clone();
+                    state.orphan = false;
+                    if changed {
+                        state.config_dirty = true;
+                        report.commands_pending_restart += 1;
+                    }
+                } else {
+                    // Fully reset so old completion icon + trailing logs disappear.
+                    *state = CommandState {
+                        config: new_cfg.clone(),
+                        process: None,
+                        status: CommandStatus::Idle,
+                        logs: VecDeque::with_capacity(LOG_CAPACITY),
+                        config_dirty: false,
+                        orphan: false,
+                    };
+                }
+            } else if state.status == CommandStatus::Running || state.process.is_some() {
+                state.orphan = true;
+                state.config_dirty = true;
+                report.commands_orphaned += 1;
+            } else {
+                cmd_drop[i] = true;
+            }
+        }
+        while let Some(true) = cmd_drop.last().copied() {
+            self.commands.pop();
+            cmd_drop.pop();
+            report.commands_dropped += 1;
+        }
+        for cfg in new.commands.iter() {
+            let exists = self.commands.iter().any(|c| c.config.name == cfg.name);
+            if !exists {
+                self.commands.push(CommandState {
+                    config: cfg.clone(),
+                    process: None,
+                    status: CommandStatus::Idle,
+                    logs: VecDeque::with_capacity(LOG_CAPACITY),
+                    config_dirty: false,
+                    orphan: false,
+                });
+                report.commands_added += 1;
+            }
+        }
+        if self.commands.is_empty() {
+            self.commands_selected = 0;
+        } else if self.commands_selected >= self.commands.len() {
+            self.commands_selected = self.commands.len() - 1;
+        }
+
+        // ----- Tools (full silent rebuild — no background threads) -----
+        let mut tools: Vec<ToolItem> = Vec::new();
+        for link in new.links.iter() {
+            tools.push(ToolItem {
+                key: link.key.chars().next().unwrap_or('?'),
+                name: link.name.clone(),
+                kind: ToolKind::Link(link.url.clone()),
+            });
+        }
+        for c in new.copies.iter() {
+            tools.push(ToolItem {
+                key: c.key.chars().next().unwrap_or('?'),
+                name: c.name.clone(),
+                kind: ToolKind::Copy(c.text.clone()),
+            });
+        }
+        self.tools = tools;
+        if self.tools.is_empty() {
+            self.tools_selected = 0;
+        } else if self.tools_selected >= self.tools.len() {
+            self.tools_selected = self.tools.len() - 1;
+        }
+
+        // ----- Project root (no mutation) -----
+        let new_root = self.config_dir.join(&new.general.project_root);
+        if new_root != self.project_root {
+            report.project_root_changed = true;
+        }
+
+        // ----- Key conflicts -----
+        report.key_conflicts = detect_key_conflicts(&self.services, &self.commands, &self.tools);
+
+        report
+    }
+}
+
+fn service_config_changed(a: &ServiceConfig, b: &ServiceConfig) -> bool {
+    a.command != b.command
+        || a.working_dir != b.working_dir
+        || a.port != b.port
+        || a.url != b.url
+        || a.depends_on != b.depends_on
+        || a.key != b.key
+        || a.service_type != b.service_type
+}
+
+fn command_config_changed(a: &CommandConfig, b: &CommandConfig) -> bool {
+    a.command != b.command || a.working_dir != b.working_dir || a.key != b.key
+}
+
+fn detect_key_conflicts(
+    services: &[ServiceState],
+    commands: &[CommandState],
+    tools: &[ToolItem],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let reserved = ['a', 'x'];
+    let mut seen = Vec::<char>::new();
+    for s in services.iter() {
+        let k = s.config.key_char().to_ascii_lowercase();
+        if k == 'q' {
+            out.push(format!("service '{}' key '{}' conflicts with quit", s.config.name, k));
+        }
+        if reserved.contains(&k) {
+            out.push(format!("service '{}' key '{}' conflicts with reserved shortcut", s.config.name, k));
+        }
+        if seen.contains(&k) {
+            out.push(format!("duplicate service key '{}'", k));
+        } else {
+            seen.push(k);
+        }
+    }
+    seen.clear();
+    for c in commands.iter() {
+        let k = c.config.key_char().to_ascii_lowercase();
+        if k == 'q' {
+            out.push(format!("command '{}' key '{}' conflicts with quit", c.config.name, k));
+        }
+        if seen.contains(&k) {
+            out.push(format!("duplicate command key '{}'", k));
+        } else {
+            seen.push(k);
+        }
+    }
+    seen.clear();
+    for t in tools.iter() {
+        let k = t.key.to_ascii_lowercase();
+        if k == 'q' {
+            out.push(format!("tool '{}' key '{}' conflicts with quit", t.name, k));
+        }
+        if seen.contains(&k) {
+            out.push(format!("duplicate tool key '{}'", k));
+        } else {
+            seen.push(k);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -755,7 +1113,7 @@ mod tests {
             links: vec![],
             copies: vec![],
         };
-        App::new(config, PathBuf::from("/tmp"))
+        App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None)
     }
 
     fn empty_app() -> App {
@@ -1306,7 +1664,7 @@ mod planned_api_tests {
             links: vec![],
             copies: vec![],
         };
-        App::new(config, PathBuf::from("/tmp"))
+        App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None)
     }
 
     fn empty_app() -> App {
@@ -1429,5 +1787,370 @@ mod planned_api_tests {
         app.log_scroll_offset = 10;
         app.select_up(); // already at 0, no selection change
         assert_eq!(app.log_scroll_offset, 10);
+    }
+
+    // ===== HMR: apply_config reconcile =====
+
+    fn link(name: &str, key: &str, url: &str) -> LinkConfig {
+        LinkConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            url: url.to_string(),
+        }
+    }
+
+    fn copy(name: &str, key: &str, text: &str) -> CopyConfig {
+        CopyConfig {
+            name: name.to_string(),
+            key: key.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    fn config_with(
+        services: Vec<ServiceConfig>,
+        commands: Vec<CommandConfig>,
+        links: Vec<LinkConfig>,
+        copies: Vec<CopyConfig>,
+    ) -> Config {
+        Config {
+            general: General { project_root: "./".to_string() },
+            services,
+            commands,
+            links,
+            copies,
+        }
+    }
+
+    #[test]
+    fn apply_config_preserves_index_for_kept_service() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        let new = config_with(vec![svc("API", "a"), svc("Web", "w")], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert_eq!(app.services.len(), 2);
+        assert_eq!(app.services[0].config.name, "API");
+        assert_eq!(app.services[1].config.name, "Web");
+        assert_eq!(report.services_added, 0);
+        assert_eq!(report.services_pending_restart, 0);
+    }
+
+    #[test]
+    fn apply_config_keeps_running_service_removed_from_config_as_orphan() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        // Mark Web as running (without spawning a real process)
+        app.services[1].status = ServiceStatus::Running;
+        let new = config_with(vec![svc("API", "a")], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert_eq!(app.services.len(), 2, "running orphan must stay in place");
+        assert_eq!(app.services[1].config.name, "Web");
+        assert_eq!(report.services_orphaned, 1);
+    }
+
+    #[test]
+    fn apply_config_marks_running_service_dirty_on_command_change() {
+        let mut app = app_with(vec![svc("API", "a")], vec![]);
+        app.services[0].status = ServiceStatus::Running;
+        let mut new_svc = svc("API", "a");
+        new_svc.command = "echo NEW".to_string();
+        let new = config_with(vec![new_svc], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert!(app.services[0].config_dirty);
+        assert_eq!(app.services[0].config.command, "echo NEW");
+        assert_eq!(report.services_pending_restart, 1);
+    }
+
+    #[test]
+    fn apply_config_stopped_service_update_is_silent_not_dirty() {
+        let mut app = app_with(vec![svc("API", "a")], vec![]);
+        // status is Stopped by default
+        let mut new_svc = svc("API", "a");
+        new_svc.command = "echo NEW".to_string();
+        let new = config_with(vec![new_svc], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert!(!app.services[0].config_dirty);
+        assert_eq!(app.services[0].config.command, "echo NEW");
+        assert_eq!(report.services_pending_restart, 0);
+    }
+
+    #[test]
+    fn apply_config_appends_new_service_to_tail() {
+        let mut app = app_with(vec![svc("API", "a")], vec![]);
+        let new = config_with(vec![svc("API", "a"), svc("Web", "w")], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert_eq!(app.services.len(), 2);
+        assert_eq!(app.services[1].config.name, "Web");
+        assert_eq!(report.services_added, 1);
+    }
+
+    #[test]
+    fn apply_config_running_service_log_routing_index_unchanged() {
+        // Old: [API=0(running), Web=1(stopped)]
+        // New config drops Web and adds Worker → API stays at idx 0 (orphan would be Web, but Web is stopped and removed; API kept)
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        app.services[0].status = ServiceStatus::Running;
+        let new = config_with(vec![svc("API", "a"), svc("Worker", "k")], vec![], vec![], vec![]);
+        app.apply_config(new);
+        // API must still be at index 0 (its background thread sends LogSource::Service(0))
+        assert_eq!(app.services[0].config.name, "API");
+        // Send a log on idx 0 and verify it lands in API's buffer
+        let _ = app.log_sender.send((LogSource::Service(0), "API log line".to_string()));
+        app.poll_logs();
+        assert!(app.services[0].logs.iter().any(|l| l.contains("API log line")));
+    }
+
+    #[test]
+    fn apply_config_rebuilds_tools_entirely() {
+        let mut app = app_with(vec![], vec![]);
+        let new = config_with(
+            vec![],
+            vec![],
+            vec![link("Docs", "d", "https://docs")],
+            vec![copy("Token", "t", "abc")],
+        );
+        app.apply_config(new);
+        assert_eq!(app.tools.len(), 2);
+    }
+
+    #[test]
+    fn apply_config_clamps_tools_selected_when_tools_shrink() {
+        let mut app = app_with(vec![], vec![]);
+        // Pre-populate tools so we can shrink
+        let pre = config_with(
+            vec![],
+            vec![],
+            vec![link("A", "a", "u1"), link("B", "b", "u2"), link("C", "c", "u3")],
+            vec![],
+        );
+        app.apply_config(pre);
+        app.tools_selected = 2;
+        let new = config_with(vec![], vec![], vec![link("A", "a", "u1")], vec![]);
+        app.apply_config(new);
+        assert_eq!(app.tools.len(), 1);
+        assert_eq!(app.tools_selected, 0);
+    }
+
+    #[test]
+    fn apply_config_reports_project_root_change_without_mutating() {
+        let mut app = app_with(vec![], vec![]);
+        let original_root = app.project_root.clone();
+        let mut new = config_with(vec![], vec![], vec![], vec![]);
+        new.general.project_root = "./other".to_string();
+        let report = app.apply_config(new);
+        assert!(report.project_root_changed);
+        assert_eq!(app.project_root, original_root, "must not mutate live root");
+    }
+
+    #[test]
+    fn apply_config_detects_key_conflicts_into_report() {
+        let mut app = app_with(vec![], vec![]);
+        let new = config_with(
+            vec![svc("A", "x"), svc("B", "x")],  // duplicate 'x', also reserved
+            vec![],
+            vec![],
+            vec![],
+        );
+        let report = app.apply_config(new);
+        assert!(!report.key_conflicts.is_empty(), "expected conflicts: {:?}", report.key_conflicts);
+    }
+
+    #[test]
+    fn apply_config_commands_reconcile_same_semantics_as_services() {
+        let mut app = app_with(vec![], vec![cmd("build", "b")]);
+        app.commands[0].status = CommandStatus::Running;
+        let mut changed = cmd("build", "b");
+        changed.command = "make".to_string();
+        let new = config_with(vec![], vec![changed, cmd("test", "t")], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert_eq!(app.commands.len(), 2);
+        assert_eq!(app.commands[1].config.name, "test");
+        assert!(app.commands[0].config_dirty);
+        assert_eq!(app.commands[0].config.command, "make");
+        assert_eq!(report.commands_added, 1);
+        assert_eq!(report.commands_pending_restart, 1);
+    }
+
+    #[test]
+    fn apply_config_empty_new_config_does_not_crash_running_app() {
+        let mut app = app_with(vec![svc("API", "a")], vec![cmd("build", "b")]);
+        app.services[0].status = ServiceStatus::Running;
+        app.commands[0].status = CommandStatus::Running;
+        let new = config_with(vec![], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        // Running entries become orphans (kept in place)
+        assert_eq!(app.services.len(), 1);
+        assert_eq!(app.commands.len(), 1);
+        assert_eq!(report.services_orphaned, 1);
+        assert_eq!(report.commands_orphaned, 1);
+        assert!(app.services[0].config_dirty);
+        assert!(app.commands[0].config_dirty);
+    }
+
+    // ===== HMR refinements: drop semantics + command reset + start clears dirty =====
+
+    #[test]
+    fn apply_config_drops_stopped_service_when_removed_from_tail() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        // Web at idx 1 is Stopped, removing from config should drop it.
+        let new = config_with(vec![svc("API", "a")], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert_eq!(app.services.len(), 1);
+        assert_eq!(app.services[0].config.name, "API");
+        assert_eq!(report.services_dropped, 1);
+        assert_eq!(report.services_orphaned, 0);
+    }
+
+    #[test]
+    fn apply_config_keeps_stopped_service_in_middle_when_blocked_by_running_tail() {
+        // [API(stopped), Web(running)] → remove API. Can't compact (Web's idx must stay 1).
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        app.services[1].status = ServiceStatus::Running;
+        let new = config_with(vec![svc("Web", "w")], vec![], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert_eq!(app.services.len(), 2, "API tombstone stays to preserve Web's idx");
+        assert_eq!(app.services[1].config.name, "Web");
+        assert_eq!(report.services_dropped, 0);
+    }
+
+    #[test]
+    fn apply_config_marks_orphan_service_dirty() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        app.services[0].status = ServiceStatus::Running;
+        let new = config_with(vec![svc("Web", "w")], vec![], vec![], vec![]);
+        app.apply_config(new);
+        assert!(app.services[0].config_dirty, "running orphan must show reload badge");
+    }
+
+    #[test]
+    fn apply_config_resets_idle_command_when_replaced() {
+        // Command that's been run (Done state, logs present) gets fully replaced.
+        let mut app = app_with(vec![], vec![cmd("build", "b")]);
+        app.commands[0].status = CommandStatus::Done;
+        app.commands[0].logs.push_back("old log line".to_string());
+        let mut changed = cmd("build", "b");
+        changed.command = "make".to_string();
+        let new = config_with(vec![], vec![changed], vec![], vec![]);
+        app.apply_config(new);
+        assert_eq!(app.commands[0].status, CommandStatus::Idle, "stopped command resets to Idle");
+        assert!(app.commands[0].logs.is_empty(), "logs cleared on replace");
+        assert!(!app.commands[0].config_dirty);
+        assert_eq!(app.commands[0].config.command, "make");
+    }
+
+    #[test]
+    fn apply_config_marks_running_command_dirty_when_changed() {
+        let mut app = app_with(vec![], vec![cmd("build", "b")]);
+        app.commands[0].status = CommandStatus::Running;
+        app.commands[0].logs.push_back("running output".to_string());
+        let mut changed = cmd("build", "b");
+        changed.command = "make".to_string();
+        let new = config_with(vec![], vec![changed], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert!(app.commands[0].config_dirty);
+        assert_eq!(report.commands_pending_restart, 1);
+        assert!(!app.commands[0].logs.is_empty(), "running command logs preserved");
+    }
+
+    #[test]
+    fn apply_config_drops_stopped_command_from_tail() {
+        let mut app = app_with(vec![], vec![cmd("build", "b"), cmd("test", "t")]);
+        let new = config_with(vec![], vec![cmd("build", "b")], vec![], vec![]);
+        let report = app.apply_config(new);
+        assert_eq!(app.commands.len(), 1);
+        assert_eq!(report.commands_dropped, 1);
+    }
+
+    #[test]
+    fn start_service_clears_config_dirty() {
+        let mut app = app_with(vec![svc("API", "a")], vec![]);
+        app.services[0].config_dirty = true;
+        // start_service() spawns a real process; just call the path that flips status + clears dirty.
+        // We exercise the same code by calling start_service through toggle_service.
+        // To avoid spawn flakiness, set port_active=true → start_service short-circuits, but
+        // doesn't clear dirty. Use a real spawnable command instead: "true" exits immediately.
+        app.services[0].config.command = "true".to_string();
+        app.services[0].config.working_dir = ".".to_string();
+        app.toggle_service(0);
+        assert!(!app.services[0].config_dirty);
+    }
+
+    #[test]
+    fn run_command_clears_config_dirty() {
+        let mut app = app_with(vec![], vec![cmd("c", "c")]);
+        app.commands[0].config_dirty = true;
+        app.commands[0].config.command = "true".to_string();
+        app.commands[0].config.working_dir = ".".to_string();
+        app.run_command(0);
+        assert!(!app.commands[0].config_dirty);
+    }
+
+    // ===== Orphan flag + auto-compact =====
+
+    #[test]
+    fn apply_config_sets_orphan_flag_for_running_removed_service() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        app.services[1].status = ServiceStatus::Running;
+        let new = config_with(vec![svc("API", "a")], vec![], vec![], vec![]);
+        app.apply_config(new);
+        assert!(app.services[1].orphan, "removed running service must be flagged orphan");
+        assert!(app.services[1].config_dirty);
+    }
+
+    #[test]
+    fn apply_config_clears_orphan_when_service_returns_to_config() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        app.services[1].status = ServiceStatus::Running;
+        // First reload: Web removed → orphan
+        app.apply_config(config_with(vec![svc("API", "a")], vec![], vec![], vec![]));
+        assert!(app.services[1].orphan);
+        // Second reload: Web returns
+        app.apply_config(config_with(vec![svc("API", "a"), svc("Web", "w")], vec![], vec![], vec![]));
+        assert!(!app.services[1].orphan, "orphan flag clears when service returns to config");
+    }
+
+    #[test]
+    fn compact_stopped_orphans_drops_stopped_orphan_from_tail() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        app.services[1].status = ServiceStatus::Running;
+        // Mark Web as orphan via reload
+        app.apply_config(config_with(vec![svc("API", "a")], vec![], vec![], vec![]));
+        assert_eq!(app.services.len(), 2);
+        // User stops Web (simulate)
+        app.services[1].status = ServiceStatus::Stopped;
+        app.services[1].process = None;
+        app.compact_stopped_orphans();
+        assert_eq!(app.services.len(), 1, "stopped orphan should auto-drop from tail");
+        assert_eq!(app.services[0].config.name, "API");
+    }
+
+    #[test]
+    fn compact_stopped_orphans_does_not_drop_if_orphan_still_running() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        app.services[1].status = ServiceStatus::Running;
+        app.apply_config(config_with(vec![svc("API", "a")], vec![], vec![], vec![]));
+        // Web still Running; compact should be a no-op
+        app.compact_stopped_orphans();
+        assert_eq!(app.services.len(), 2);
+    }
+
+    #[test]
+    fn compact_stopped_orphans_does_not_drop_non_orphan_stopped() {
+        let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
+        // Web is stopped but NOT an orphan (still in config)
+        app.compact_stopped_orphans();
+        assert_eq!(app.services.len(), 2, "stopped non-orphan services stay");
+    }
+
+    #[test]
+    fn compact_stopped_orphans_handles_commands_too() {
+        let mut app = app_with(vec![], vec![cmd("a", "a"), cmd("b", "b")]);
+        app.commands[1].status = CommandStatus::Running;
+        app.apply_config(config_with(vec![], vec![cmd("a", "a")], vec![], vec![]));
+        assert_eq!(app.commands.len(), 2);
+        assert!(app.commands[1].orphan);
+        // Command finishes
+        app.commands[1].status = CommandStatus::Done;
+        app.commands[1].process = None;
+        app.compact_stopped_orphans();
+        assert_eq!(app.commands.len(), 1);
     }
 }

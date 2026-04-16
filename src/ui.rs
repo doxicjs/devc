@@ -105,21 +105,31 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         )
         .divider("│");
 
-    // Render tabs and status on the same line
+    // Render tabs and status on the same line.
+    // When a transient status flash is active, it takes the right slot;
+    // otherwise the persistent N/M running count is shown.
+    let right_text = if let Some((msg, _)) = &app.status {
+        format!(" {} ", msg)
+    } else {
+        format!(" {}/{} running ", running, total)
+    };
+    let right_color = if app.status.is_some() || running > 0 {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    let right_width = (right_text.chars().count() as u16).max(16);
+
     let header_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(16)])
+        .constraints([Constraint::Min(20), Constraint::Length(right_width)])
         .split(area);
 
     f.render_widget(tabs, header_layout[0]);
 
     let status = Paragraph::new(Line::from(vec![Span::styled(
-        format!(" {}/{} running ", running, total),
-        Style::default().fg(if running > 0 {
-            Color::Green
-        } else {
-            Color::DarkGray
-        }),
+        right_text,
+        Style::default().fg(right_color),
     )]));
     f.render_widget(status, header_layout[1]);
 }
@@ -146,7 +156,7 @@ fn draw_services(f: &mut Frame, app: &App, area: Rect) {
                 .map(|p| format!(":{}", p))
                 .unwrap_or_default();
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" [{}] ", service.config.key_char().to_ascii_uppercase()),
                     Style::default().fg(Color::Yellow),
@@ -156,7 +166,19 @@ fn draw_services(f: &mut Frame, app: &App, area: Rect) {
                     format!("{}{}", service.config.name, port_str),
                     Style::default().fg(Color::White),
                 ),
-            ]);
+            ];
+            if service.orphan {
+                spans.push(Span::styled(
+                    " [removed]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            } else if service.config_dirty {
+                spans.push(Span::styled(
+                    " [reload]",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            }
+            let line = Line::from(spans);
 
             let item = ListItem::new(line);
             if i == app.selected {
@@ -216,14 +238,26 @@ fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
                 CommandStatus::Failed => ("✗", Color::Red),
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" [{}] ", cmd.config.key_char().to_ascii_uppercase()),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
-                Span::styled(&cmd.config.name, Style::default().fg(Color::White)),
-            ]);
+                Span::styled(cmd.config.name.clone(), Style::default().fg(Color::White)),
+            ];
+            if cmd.orphan {
+                spans.push(Span::styled(
+                    " [removed]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            } else if cmd.config_dirty {
+                spans.push(Span::styled(
+                    " [reload]",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            }
+            let line = Line::from(spans);
 
             let item = ListItem::new(line);
             if i == app.commands_selected {
@@ -332,7 +366,7 @@ fn draw_tool_detail(f: &mut Frame, app: &App, area: Rect) {
         ToolKind::Copy(text) => ("Text", text.as_str()),
     };
 
-    let mut lines = vec![
+    let lines = vec![
         Line::from(Span::styled(
             &tool.name,
             Style::default()
@@ -345,14 +379,6 @@ fn draw_tool_detail(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(value),
         ]),
     ];
-
-    if let Some((msg, _)) = &app.status {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            msg.as_str(),
-            Style::default().fg(Color::Green),
-        )));
-    }
 
     let paragraph = Paragraph::new(lines)
         .block(
@@ -407,7 +433,21 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let version = format!(" devc v{} ", env!("CARGO_PKG_VERSION"));
+    let version_width = version.chars().count() as u16;
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(version_width)])
+        .split(area);
+
+    f.render_widget(Paragraph::new(Line::from(spans)), row[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            version,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        row[1],
+    );
 }
 
 #[cfg(test)]
@@ -456,7 +496,7 @@ mod tests {
     #[test]
     fn draw_with_empty_services_does_not_panic() {
         let config = make_config(vec![], vec![cmd("build", "b")]);
-        let app = App::new(config, PathBuf::from("/tmp"));
+        let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         // Panics on current code: draw_logs does app.services[app.selected]
@@ -466,7 +506,7 @@ mod tests {
     #[test]
     fn draw_with_empty_everything_does_not_panic() {
         let config = make_config(vec![], vec![]);
-        let app = App::new(config, PathBuf::from("/tmp"));
+        let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -477,7 +517,7 @@ mod tests {
     #[test]
     fn draw_services_tab_with_services() {
         let config = make_config(vec![svc("web", "w"), svc("api", "a")], vec![]);
-        let app = App::new(config, PathBuf::from("/tmp"));
+        let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -486,7 +526,7 @@ mod tests {
     #[test]
     fn draw_commands_tab_no_commands() {
         let config = make_config(vec![svc("web", "w")], vec![]);
-        let mut app = App::new(config, PathBuf::from("/tmp"));
+        let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Commands;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -496,7 +536,7 @@ mod tests {
     #[test]
     fn draw_commands_tab_with_commands() {
         let config = make_config(vec![], vec![cmd("build", "b"), cmd("test", "t")]);
-        let mut app = App::new(config, PathBuf::from("/tmp"));
+        let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Commands;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -506,7 +546,7 @@ mod tests {
     #[test]
     fn draw_tools_tab_empty() {
         let config = make_config(vec![], vec![]);
-        let mut app = App::new(config, PathBuf::from("/tmp"));
+        let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Tools;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -530,7 +570,7 @@ mod tests {
                 text: "abc123".to_string(),
             }],
         };
-        let mut app = App::new(config, PathBuf::from("/tmp"));
+        let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Tools;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -542,7 +582,7 @@ mod tests {
     #[test]
     fn draw_with_tiny_terminal() {
         let config = make_config(vec![svc("web", "w")], vec![]);
-        let app = App::new(config, PathBuf::from("/tmp"));
+        let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(10, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -551,7 +591,7 @@ mod tests {
     #[test]
     fn draw_with_single_row_terminal() {
         let config = make_config(vec![svc("web", "w")], vec![]);
-        let app = App::new(config, PathBuf::from("/tmp"));
+        let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
