@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
-use crate::commands::{CommandsPane, CommandState};
+use crate::commands::CommandsPane;
 use crate::config::Config;
 use crate::config_watcher::{ConfigWatcher, WatchEvent};
 use crate::id::{CommandId, ServiceId};
 use crate::port_monitor::PortMonitor;
-use crate::services::{ServicesPane, ServiceState};
+use crate::services::ServicesPane;
 use crate::status::StatusBar;
-use crate::tools::{ToolItem, ToolsPane};
+use crate::tools::ToolsPane;
 
 /// Log messages are tagged with a source: Service(id) or Command(id)
 pub enum LogSource {
@@ -94,7 +94,7 @@ impl App {
         let commands = CommandsPane::from_config(config.commands);
         let tools = ToolsPane::from_config(config.links, config.copies);
 
-        for warning in detect_key_conflicts(services.items(), commands.items(), tools.items()) {
+        for warning in crate::keys::detect_conflicts(services.items(), commands.items(), tools.items()) {
             eprintln!("warning: {}", warning);
         }
 
@@ -197,6 +197,7 @@ impl App {
                 'a' => self.services.start_all(&self.project_root),
                 'x' => self.services.stop_all(),
                 _ => {
+                    if crate::keys::is_services_reserved(c) { return; }
                     if let Some(idx) = self.services.find_by_key(c) {
                         self.services.toggle(idx, &self.project_root);
                     }
@@ -255,6 +256,23 @@ impl App {
         self.commands.compact_stopped_orphans();
     }
 
+    pub fn poll(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        self.check_config_reload();
+        self.services.compact_stopped_orphans();
+        self.commands.compact_stopped_orphans();
+        self.services.poll_logs();
+        self.commands.poll_logs();
+        self.services.check_processes();
+        self.commands.check_processes();
+        // Port monitoring
+        self.services.apply_ports(&self.port_monitor.drain());
+        if self.port_monitor.should_check(self.tick) {
+            self.port_monitor.kick(self.services.port_targets());
+        }
+        self.status.clear_if_expired();
+    }
+
     pub fn check_config_reload(&mut self) {
         match self.config_watcher.poll() {
             WatchEvent::Idle => {}
@@ -293,60 +311,14 @@ impl App {
         }
 
         // ----- Key conflicts -----
-        report.key_conflicts = detect_key_conflicts(self.services.items(), self.commands.items(), self.tools.items());
+        report.key_conflicts = crate::keys::detect_conflicts(
+            self.services.items(), self.commands.items(), self.tools.items(),
+        );
 
         report
     }
 }
 
-fn detect_key_conflicts(
-    services: &[ServiceState],
-    commands: &[CommandState],
-    tools: &[ToolItem],
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let reserved = ['a', 'x'];
-    let mut seen = Vec::<char>::new();
-    for s in services.iter() {
-        let k = s.config.key_char().to_ascii_lowercase();
-        if k == 'q' {
-            out.push(format!("service '{}' key '{}' conflicts with quit", s.config.name, k));
-        }
-        if reserved.contains(&k) {
-            out.push(format!("service '{}' key '{}' conflicts with reserved shortcut", s.config.name, k));
-        }
-        if seen.contains(&k) {
-            out.push(format!("duplicate service key '{}'", k));
-        } else {
-            seen.push(k);
-        }
-    }
-    seen.clear();
-    for c in commands.iter() {
-        let k = c.config.key_char().to_ascii_lowercase();
-        if k == 'q' {
-            out.push(format!("command '{}' key '{}' conflicts with quit", c.config.name, k));
-        }
-        if seen.contains(&k) {
-            out.push(format!("duplicate command key '{}'", k));
-        } else {
-            seen.push(k);
-        }
-    }
-    seen.clear();
-    for t in tools.iter() {
-        let k = t.key.to_ascii_lowercase();
-        if k == 'q' {
-            out.push(format!("tool '{}' key '{}' conflicts with quit", t.name, k));
-        }
-        if seen.contains(&k) {
-            out.push(format!("duplicate tool key '{}'", k));
-        } else {
-            seen.push(k);
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {

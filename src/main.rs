@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod config_watcher;
 mod id;
+mod keys;
 mod platform;
 mod port_monitor;
 mod process;
@@ -141,13 +142,7 @@ fn run(
             break;
         }
 
-        app.tick();
-        app.check_config_reload();
-        app.compact_stopped_orphans();
-        app.poll_logs();
-        app.check_processes();
-        app.check_ports();
-        app.status.clear_if_expired();
+        app.poll();
 
         terminal.draw(|f| ui::draw(f, app))?;
 
