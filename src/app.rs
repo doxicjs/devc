@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Max lines kept per service/command log buffer (oldest evicted first).
 const LOG_CAPACITY: usize = 500;
@@ -11,6 +11,7 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(3);
 use crate::config::Config;
 use crate::config::ServiceConfig;
 use crate::config::CommandConfig;
+use crate::config_watcher::{ConfigWatcher, WatchEvent};
 use crate::id::{CommandId, ServiceId};
 use crate::port_monitor::PortMonitor;
 use crate::process::ProcessHandle;
@@ -141,12 +142,7 @@ pub struct App {
     port_monitor: PortMonitor,
     project_root: PathBuf,
     config_dir: PathBuf,
-    config_path: PathBuf,
-    local_config_path: Option<PathBuf>,
-    config_mtime: Option<SystemTime>,
-    local_mtime: Option<SystemTime>,
-    reload_pending_since: Option<Instant>,
-    reload_fail_count: u8,
+    config_watcher: ConfigWatcher,
     pub log_scroll_offset: usize,
     pub cmd_log_scroll_offset: usize,
 }
@@ -219,12 +215,6 @@ impl App {
             eprintln!("warning: {}", warning);
         }
 
-        fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
-            std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
-        }
-        let config_mtime = file_mtime(&config_path);
-        let local_mtime = local_config_path.as_ref().and_then(|p| file_mtime(p));
-
         Self {
             services,
             commands,
@@ -242,12 +232,7 @@ impl App {
             port_monitor: PortMonitor::new(),
             project_root,
             config_dir,
-            config_path,
-            local_config_path,
-            config_mtime,
-            local_mtime,
-            reload_pending_since: None,
-            reload_fail_count: 0,
+            config_watcher: ConfigWatcher::new(config_path, local_config_path),
             log_scroll_offset: 0,
             cmd_log_scroll_offset: 0,
         }
@@ -768,68 +753,13 @@ impl App {
     }
 
     pub fn check_config_reload(&mut self) {
-        fn file_mtime(path: &std::path::Path) -> Result<Option<SystemTime>, std::io::Error> {
-            match std::fs::metadata(path) {
-                Ok(m) => Ok(m.modified().ok()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e),
-            }
-        }
-
-        let main_mtime = match file_mtime(&self.config_path) {
-            Ok(Some(m)) => {
-                self.reload_fail_count = 0;
-                Some(m)
-            }
-            Ok(None) | Err(_) => {
-                // Missing or unreadable. Tolerate up to 3 consecutive ticks (atomic-rename window).
-                self.reload_fail_count = self.reload_fail_count.saturating_add(1);
-                if self.reload_fail_count == 3 {
-                    self.status.set("config file missing".to_string());
-                }
-                return;
-            }
-        };
-
-        let local_mtime = match self.local_config_path.as_ref() {
-            Some(p) => file_mtime(p).unwrap_or(None),
-            None => None,
-        };
-
-        let main_changed = main_mtime != self.config_mtime;
-        let local_changed = local_mtime != self.local_mtime;
-
-        if !main_changed && !local_changed && self.reload_pending_since.is_none() {
-            return;
-        }
-
-        // First detection: start debounce window (~100ms = one more tick).
-        if self.reload_pending_since.is_none() {
-            self.reload_pending_since = Some(Instant::now());
-            return;
-        }
-
-        // Wait until debounce elapses.
-        if self.reload_pending_since.unwrap().elapsed() < Duration::from_millis(100) {
-            return;
-        }
-
-        // Time to reload.
-        let local_path = self.local_config_path.clone();
-        match crate::config::Config::load(&self.config_path, local_path.as_deref()) {
-            Ok(new_cfg) => {
-                self.config_mtime = main_mtime;
-                self.local_mtime = local_mtime;
-                self.reload_pending_since = None;
+        match self.config_watcher.poll() {
+            WatchEvent::Idle => {}
+            WatchEvent::Reloaded(new_cfg) => {
                 let report = self.apply_config(new_cfg);
                 self.status.set(report.summary());
             }
-            Err(e) => {
-                self.reload_pending_since = None;
-                // Leave stored mtimes unchanged so a subsequent edit (which will bump mtime
-                // again) re-triggers a reload attempt.
-                self.status.set(format!("config reload failed: {}", e));
-            }
+            WatchEvent::Error(msg) | WatchEvent::Notice(msg) => self.status.set(msg),
         }
     }
 

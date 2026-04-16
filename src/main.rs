@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod config_watcher;
 mod id;
 mod platform;
 mod port_monitor;
