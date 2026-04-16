@@ -8,9 +8,9 @@ const LOG_CAPACITY: usize = 500;
 /// Seconds to wait after SIGTERM before escalating to SIGKILL.
 const KILL_TIMEOUT: Duration = Duration::from_secs(3);
 
+use crate::commands::{CommandsPane, CommandState};
 use crate::config::Config;
 use crate::config::ServiceConfig;
-use crate::config::CommandConfig;
 use crate::config_watcher::{ConfigWatcher, WatchEvent};
 use crate::id::{CommandId, ServiceId};
 use crate::port_monitor::PortMonitor;
@@ -33,24 +33,6 @@ pub struct ServiceState {
     pub status: ServiceStatus,
     pub port_active: bool,
     pub stopping_since: Option<Instant>,
-    pub logs: VecDeque<String>,
-    pub config_dirty: bool,
-    pub orphan: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandStatus {
-    Idle,
-    Running,
-    Done,
-    Failed,
-}
-
-pub struct CommandState {
-    pub id: CommandId,
-    pub config: CommandConfig,
-    pub process: Option<ProcessHandle>,
-    pub status: CommandStatus,
     pub logs: VecDeque<String>,
     pub config_dirty: bool,
     pub orphan: bool,
@@ -117,15 +99,13 @@ impl ReloadReport {
 
 pub struct App {
     pub services: Vec<ServiceState>,
-    pub commands: Vec<CommandState>,
-    pub commands_selected: usize,
+    pub commands: CommandsPane,
     pub selected: usize,
     pub tab: Tab,
     pub tools: ToolsPane,
     pub status: StatusBar,
     pub tick: u64,
     next_service_id: u64,
-    next_command_id: u64,
     log_receiver: mpsc::Receiver<(LogSource, String)>,
     log_sender: mpsc::Sender<(LogSource, String)>,
     port_monitor: PortMonitor,
@@ -133,7 +113,6 @@ pub struct App {
     config_dir: PathBuf,
     config_watcher: ConfigWatcher,
     pub log_scroll_offset: usize,
-    pub cmd_log_scroll_offset: usize,
 }
 
 impl App {
@@ -166,41 +145,23 @@ impl App {
             })
             .collect();
 
-        let mut next_command_id: u64 = 0;
-        let commands: Vec<CommandState> = config
-            .commands
-            .into_iter()
-            .map(|cfg| {
-                next_command_id += 1;
-                CommandState {
-                    id: CommandId(next_command_id),
-                    config: cfg,
-                    process: None,
-                    status: CommandStatus::Idle,
-                    logs: VecDeque::with_capacity(LOG_CAPACITY),
-                    config_dirty: false,
-                    orphan: false,
-                }
-            })
-            .collect();
+        let commands = CommandsPane::from_config(config.commands);
 
         let tools = ToolsPane::from_config(config.links, config.copies);
 
-        for warning in detect_key_conflicts(&services, &commands, tools.items()) {
+        for warning in detect_key_conflicts(&services, commands.items(), tools.items()) {
             eprintln!("warning: {}", warning);
         }
 
         Self {
             services,
             commands,
-            commands_selected: 0,
             selected: 0,
             tab: Tab::Services,
             tools,
             status: StatusBar::new(),
             tick: 0,
             next_service_id,
-            next_command_id,
             log_receiver: rx,
             log_sender: tx,
             port_monitor: PortMonitor::new(),
@@ -208,7 +169,6 @@ impl App {
             config_dir,
             config_watcher: ConfigWatcher::new(config_path, local_config_path),
             log_scroll_offset: 0,
-            cmd_log_scroll_offset: 0,
         }
     }
 
@@ -241,13 +201,7 @@ impl App {
                     self.log_scroll_offset = 0;
                 }
             }
-            Tab::Commands => {
-                let new = self.commands_selected.saturating_sub(1);
-                if new != self.commands_selected {
-                    self.commands_selected = new;
-                    self.cmd_log_scroll_offset = 0;
-                }
-            }
+            Tab::Commands => self.commands.select_up(),
             Tab::Tools => self.tools.select_up(),
         }
     }
@@ -260,12 +214,7 @@ impl App {
                     self.log_scroll_offset = 0;
                 }
             }
-            Tab::Commands => {
-                if self.commands_selected + 1 < self.commands.len() {
-                    self.commands_selected += 1;
-                    self.cmd_log_scroll_offset = 0;
-                }
-            }
+            Tab::Commands => self.commands.select_down(),
             Tab::Tools => self.tools.select_down(),
         }
     }
@@ -277,11 +226,7 @@ impl App {
                 self.log_scroll_offset =
                     self.log_scroll_offset.saturating_add(amount).min(max);
             }
-            Tab::Commands => {
-                let max = self.commands.get(self.commands_selected).map_or(0, |c| c.logs.len());
-                self.cmd_log_scroll_offset =
-                    self.cmd_log_scroll_offset.saturating_add(amount).min(max);
-            }
+            Tab::Commands => self.commands.scroll_up(amount),
             Tab::Tools => {}
         }
     }
@@ -291,9 +236,7 @@ impl App {
             Tab::Services => {
                 self.log_scroll_offset = self.log_scroll_offset.saturating_sub(amount);
             }
-            Tab::Commands => {
-                self.cmd_log_scroll_offset = self.cmd_log_scroll_offset.saturating_sub(amount);
-            }
+            Tab::Commands => self.commands.scroll_down(amount),
             Tab::Tools => {}
         }
     }
@@ -301,7 +244,7 @@ impl App {
     pub fn scroll_to_bottom(&mut self) {
         match self.tab {
             Tab::Services => self.log_scroll_offset = 0,
-            Tab::Commands => self.cmd_log_scroll_offset = 0,
+            Tab::Commands => self.commands.scroll_to_bottom(),
             Tab::Tools => {}
         }
     }
@@ -313,8 +256,8 @@ impl App {
                 self.toggle_service(idx);
             }
             Tab::Commands => {
-                let idx = self.commands_selected;
-                self.run_command(idx);
+                let idx = self.commands.selected_idx();
+                self.commands.run(idx, &self.project_root);
             }
             Tab::Tools => {
                 let idx = self.tools.selected_idx();
@@ -460,55 +403,6 @@ impl App {
             .count()
     }
 
-    // --- Commands ---
-
-    pub fn run_command(&mut self, idx: usize) {
-        if idx >= self.commands.len() {
-            return;
-        }
-
-        // Don't run if already running
-        if self.commands[idx].status == CommandStatus::Running {
-            return;
-        }
-
-        let cmd_state = &mut self.commands[idx];
-        cmd_state.logs.clear();
-        cmd_state.status = CommandStatus::Running;
-        cmd_state.config_dirty = false;
-
-        let working_dir = self.project_root.join(&cmd_state.config.working_dir);
-        let cmd = cmd_state.config.command.clone();
-        cmd_state
-            .logs
-            .push_back(format!("── running: {} ──", cmd));
-
-        let sender = self.log_sender.clone();
-        let cmd_id = cmd_state.id;
-
-        match ProcessHandle::spawn(
-            &cmd,
-            working_dir.to_str().unwrap_or("."),
-            sender,
-            move || LogSource::Command(cmd_id),
-        ) {
-            Ok(handle) => {
-                cmd_state.process = Some(handle);
-            }
-            Err(e) => {
-                cmd_state.logs.push_back(format!("error: {}", e));
-                cmd_state.status = CommandStatus::Failed;
-            }
-        }
-    }
-
-    pub fn find_command_by_key(&self, key: char) -> Option<usize> {
-        let key_lower = key.to_ascii_lowercase();
-        self.commands
-            .iter()
-            .position(|c| c.config.key_char().to_ascii_lowercase() == key_lower)
-    }
-
     pub fn handle_char(&mut self, c: char) {
         match self.tab {
             Tab::Services => match c {
@@ -521,8 +415,8 @@ impl App {
                 }
             },
             Tab::Commands => {
-                if let Some(idx) = self.find_command_by_key(c) {
-                    self.run_command(idx);
+                if let Some(idx) = self.commands.find_by_key(c) {
+                    self.commands.run(idx, &self.project_root);
                 }
             }
             Tab::Tools => {
@@ -544,25 +438,18 @@ impl App {
 
     pub fn poll_logs(&mut self) {
         while let Ok((source, line)) = self.log_receiver.try_recv() {
-            match source {
-                LogSource::Service(id) => {
-                    if let Some(service) = self.services.iter_mut().find(|s| s.id == id) {
-                        service.logs.push_back(line);
-                        if service.logs.len() > LOG_CAPACITY {
-                            service.logs.pop_front();
-                        }
-                    }
-                }
-                LogSource::Command(id) => {
-                    if let Some(cmd) = self.commands.iter_mut().find(|c| c.id == id) {
-                        cmd.logs.push_back(line);
-                        if cmd.logs.len() > LOG_CAPACITY {
-                            cmd.logs.pop_front();
-                        }
+            if let LogSource::Service(id) = source {
+                if let Some(service) = self.services.iter_mut().find(|s| s.id == id) {
+                    service.logs.push_back(line);
+                    if service.logs.len() > LOG_CAPACITY {
+                        service.logs.pop_front();
                     }
                 }
             }
+            // LogSource::Command messages no longer flow through this channel;
+            // CommandsPane owns its own. Ignore stray ones if any arrive.
         }
+        self.commands.poll_logs();
     }
 
     pub fn check_processes(&mut self) {
@@ -609,27 +496,7 @@ impl App {
             }
         }
 
-        // Check command processes
-        for cmd in &mut self.commands {
-            if cmd.status == CommandStatus::Running {
-                if let Some(proc) = &mut cmd.process {
-                    if !proc.is_running() {
-                        let exit_code = proc.exit_code();
-                        cmd.process = None;
-                        if exit_code == Some(0) {
-                            cmd.status = CommandStatus::Done;
-                            cmd.logs.push_back("── done ──".to_string());
-                        } else {
-                            cmd.status = CommandStatus::Failed;
-                            cmd.logs.push_back(format!(
-                                "── failed (exit {}) ──",
-                                exit_code.map(|c| c.to_string()).unwrap_or("?".into())
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        self.commands.check_processes();
     }
 
     pub fn check_ports(&mut self) {
@@ -655,11 +522,7 @@ impl App {
                 proc.kill();
             }
         }
-        for cmd in &mut self.commands {
-            if let Some(mut proc) = cmd.process.take() {
-                proc.kill();
-            }
-        }
+        self.commands.cleanup();
     }
 
     /// Tail-compact services and commands whose `orphan` flag is set and that have
@@ -681,18 +544,7 @@ impl App {
         } else if self.selected >= self.services.len() {
             self.selected = self.services.len() - 1;
         }
-        while let Some(c) = self.commands.last() {
-            if c.orphan && c.status != CommandStatus::Running && c.process.is_none() {
-                self.commands.pop();
-            } else {
-                break;
-            }
-        }
-        if self.commands.is_empty() {
-            self.commands_selected = 0;
-        } else if self.commands_selected >= self.commands.len() {
-            self.commands_selected = self.commands.len() - 1;
-        }
+        self.commands.compact_stopped_orphans();
     }
 
     pub fn check_config_reload(&mut self) {
@@ -769,68 +621,11 @@ impl App {
         }
 
         // ----- Commands -----
-        // Kept+not-running → fully replace state (logs cleared, status reset).
-        // Kept+running → keep state; set dirty if changed.
-        // Removed+running → orphan (dirty).
-        // Removed+stopped → mark for tail-compact drop.
-        let mut cmd_drop: Vec<bool> = vec![false; self.commands.len()];
-        for (i, state) in self.commands.iter_mut().enumerate() {
-            if let Some(new_cfg) = new.commands.iter().find(|c| c.name == state.config.name) {
-                let changed = command_config_changed(&state.config, new_cfg);
-                if state.status == CommandStatus::Running {
-                    state.config = new_cfg.clone();
-                    state.orphan = false;
-                    if changed {
-                        state.config_dirty = true;
-                        report.commands_pending_restart += 1;
-                    }
-                } else {
-                    // Fully reset so old completion icon + trailing logs disappear.
-                    let preserved_id = state.id;
-                    *state = CommandState {
-                        id: preserved_id,
-                        config: new_cfg.clone(),
-                        process: None,
-                        status: CommandStatus::Idle,
-                        logs: VecDeque::with_capacity(LOG_CAPACITY),
-                        config_dirty: false,
-                        orphan: false,
-                    };
-                }
-            } else if state.status == CommandStatus::Running || state.process.is_some() {
-                state.orphan = true;
-                state.config_dirty = true;
-                report.commands_orphaned += 1;
-            } else {
-                cmd_drop[i] = true;
-            }
-        }
-        while let Some(true) = cmd_drop.last().copied() {
-            self.commands.pop();
-            cmd_drop.pop();
-            report.commands_dropped += 1;
-        }
-        for cfg in new.commands.iter() {
-            let exists = self.commands.iter().any(|c| c.config.name == cfg.name);
-            if !exists {
-                self.next_command_id += 1;
-                self.commands.push(CommandState {
-                    id: CommandId(self.next_command_id),
-                    config: cfg.clone(),
-                    process: None,
-                    status: CommandStatus::Idle,
-                    logs: VecDeque::with_capacity(LOG_CAPACITY),
-                    config_dirty: false,
-                    orphan: false,
-                });
-                report.commands_added += 1;
-            }
-        }
-        if self.commands.is_empty() {
-            self.commands_selected = 0;
-        } else if self.commands_selected >= self.commands.len() {
-            self.commands_selected = self.commands.len() - 1;
-        }
+        let cmd_delta = self.commands.apply_config(&new.commands);
+        report.commands_added = cmd_delta.added;
+        report.commands_dropped = cmd_delta.dropped;
+        report.commands_pending_restart = cmd_delta.pending_restart;
+        report.commands_orphaned = cmd_delta.orphaned;
 
         // ----- Tools (full silent rebuild — no background threads) -----
         self.tools.rebuild(&new.links, &new.copies);
@@ -842,7 +637,7 @@ impl App {
         }
 
         // ----- Key conflicts -----
-        report.key_conflicts = detect_key_conflicts(&self.services, &self.commands, self.tools.items());
+        report.key_conflicts = detect_key_conflicts(&self.services, self.commands.items(), self.tools.items());
 
         report
     }
@@ -856,10 +651,6 @@ fn service_config_changed(a: &ServiceConfig, b: &ServiceConfig) -> bool {
         || a.depends_on != b.depends_on
         || a.key != b.key
         || a.service_type != b.service_type
-}
-
-fn command_config_changed(a: &CommandConfig, b: &CommandConfig) -> bool {
-    a.command != b.command || a.working_dir != b.working_dir || a.key != b.key
 }
 
 fn detect_key_conflicts(
@@ -914,6 +705,7 @@ fn detect_key_conflicts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::CommandStatus;
     use crate::config::*;
     use crate::id::{CommandId, ServiceId};
     use std::path::PathBuf;
@@ -1035,7 +827,7 @@ mod tests {
         );
         app.tab = Tab::Commands;
         app.select_down();
-        assert_eq!(app.commands_selected, 1);
+        assert_eq!(app.commands.selected_idx(), 1);
     }
 
     #[test]
@@ -1043,7 +835,7 @@ mod tests {
         let mut app = empty_app();
         app.tab = Tab::Commands;
         app.select_down();
-        assert_eq!(app.commands_selected, 0);
+        assert_eq!(app.commands.selected_idx(), 0);
     }
 
     // ===== Empty list safety =====
@@ -1063,13 +855,13 @@ mod tests {
     #[test]
     fn run_command_empty_no_panic() {
         let mut app = empty_app();
-        app.run_command(0);
+        app.commands.run(0, &app.project_root.clone());
     }
 
     #[test]
     fn run_command_out_of_bounds_no_panic() {
         let mut app = app_with(vec![], vec![cmd("a", "a", "echo a")]);
-        app.run_command(99);
+        app.commands.run(99, &app.project_root.clone());
     }
 
     #[test]
@@ -1111,7 +903,8 @@ mod tests {
             vec![],
             vec![cmd("sleeper", "s", "sleep 100")],
         );
-        app.run_command(0);
+        let root = app.project_root.clone();
+        app.commands.run(0, &root);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
             app.commands[0].process.is_some(),
@@ -1156,13 +949,13 @@ mod tests {
     #[test]
     fn find_command_by_key_found() {
         let app = app_with(vec![], vec![cmd("build", "b", "echo b")]);
-        assert_eq!(app.find_command_by_key('b'), Some(0));
+        assert_eq!(app.commands.find_by_key('b'), Some(0));
     }
 
     #[test]
     fn find_command_by_key_no_match() {
         let app = app_with(vec![], vec![cmd("build", "b", "echo b")]);
-        assert_eq!(app.find_command_by_key('z'), None);
+        assert_eq!(app.commands.find_by_key('z'), None);
     }
 
     // ===== Running count =====
@@ -1289,11 +1082,13 @@ mod tests {
     #[test]
     fn command_logs_capped_at_500() {
         let mut app = app_with(vec![], vec![cmd("build", "b", "echo b")]);
-        let cmd_id = app.commands[0].id;
+        // CommandsPane owns its own channel; push directly to the log buffer.
         for i in 0..600 {
-            let _ = app.log_sender.send((LogSource::Command(cmd_id), format!("line {}", i)));
+            app.commands[0].logs.push_back(format!("line {}", i));
+            if app.commands[0].logs.len() > crate::commands::LOG_CAPACITY {
+                app.commands[0].logs.pop_front();
+            }
         }
-        app.poll_logs();
         assert_eq!(app.commands[0].logs.len(), 500);
     }
 
@@ -1370,7 +1165,8 @@ mod tests {
     #[test]
     fn integration_run_command_completes() {
         let mut app = app_with(vec![], vec![cmd("echo", "e", "echo done")]);
-        app.run_command(0);
+        let root = app.project_root.clone();
+        app.commands.run(0, &root);
         assert_eq!(app.commands[0].status, CommandStatus::Running);
         // Wait for command to finish
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1384,7 +1180,8 @@ mod tests {
     #[test]
     fn integration_failed_command_reports_failure() {
         let mut app = app_with(vec![], vec![cmd("fail", "f", "false")]);
-        app.run_command(0);
+        let root = app.project_root.clone();
+        app.commands.run(0, &root);
         std::thread::sleep(std::time::Duration::from_millis(500));
         app.poll_logs();
         app.check_processes();
@@ -1394,7 +1191,8 @@ mod tests {
     #[test]
     fn integration_command_output_collected() {
         let mut app = app_with(vec![], vec![cmd("echo", "e", "echo hello_world")]);
-        app.run_command(0);
+        let root = app.project_root.clone();
+        app.commands.run(0, &root);
         std::thread::sleep(std::time::Duration::from_millis(500));
         app.poll_logs();
         assert!(
@@ -1468,6 +1266,7 @@ mod tests {
 #[cfg(test)]
 mod planned_api_tests {
     use super::*;
+    use crate::commands::CommandStatus;
     use crate::config::*;
     use std::path::PathBuf;
 
@@ -1580,15 +1379,13 @@ mod planned_api_tests {
     #[test]
     fn scroll_up_commands_tab_uses_cmd_offset() {
         let mut app = app_with(vec![], vec![cmd("build", "b")]);
-        let cmd_id = app.commands[0].id;
-        // Add log lines so scroll has room
+        // Add log lines directly (CommandsPane owns its own channel)
         for i in 0..20 {
-            let _ = app.log_sender.send((LogSource::Command(cmd_id), format!("line {}", i)));
+            app.commands[0].logs.push_back(format!("line {}", i));
         }
-        app.poll_logs();
         app.tab = Tab::Commands;
         app.scroll_up(5);
-        assert_eq!(app.cmd_log_scroll_offset, 5);
+        assert_eq!(app.commands.log_scroll_offset, 5);
         assert_eq!(app.log_scroll_offset, 0);
     }
 
@@ -1598,7 +1395,7 @@ mod planned_api_tests {
         app.tab = Tab::Tools;
         app.scroll_up(10);
         assert_eq!(app.log_scroll_offset, 0);
-        assert_eq!(app.cmd_log_scroll_offset, 0);
+        assert_eq!(app.commands.log_scroll_offset, 0);
     }
 
     #[test]
@@ -1922,7 +1719,8 @@ mod planned_api_tests {
         app.commands[0].config_dirty = true;
         app.commands[0].config.command = "true".to_string();
         app.commands[0].config.working_dir = ".".to_string();
-        app.run_command(0);
+        let root = app.project_root.clone();
+        app.commands.run(0, &root);
         assert!(!app.commands[0].config_dirty);
     }
 

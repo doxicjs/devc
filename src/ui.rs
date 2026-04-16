@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, CommandStatus, ServiceStatus, Tab};
+use crate::app::{App, ServiceStatus, Tab};
+use crate::commands::CommandStatus;
 use crate::tools::ToolKind;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -229,6 +230,7 @@ fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
 
     let items: Vec<ListItem> = app
         .commands
+        .items()
         .iter()
         .enumerate()
         .map(|(i, cmd)| {
@@ -261,7 +263,7 @@ fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
             let line = Line::from(spans);
 
             let item = ListItem::new(line);
-            if i == app.commands_selected {
+            if i == app.commands.selected_idx() {
                 item.style(
                     Style::default()
                         .bg(Color::DarkGray)
@@ -284,7 +286,7 @@ fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_command_logs(f: &mut Frame, app: &App, area: Rect) {
-    let Some(cmd) = app.commands.get(app.commands_selected) else {
+    let Some(cmd) = app.commands.items().get(app.commands.selected_idx()) else {
         let empty = Paragraph::new("No commands configured").block(
             Block::default()
                 .title(" Output ")
@@ -298,7 +300,7 @@ fn draw_command_logs(f: &mut Frame, app: &App, area: Rect) {
         f,
         &cmd.logs,
         format!(" {} ", cmd.config.name),
-        app.cmd_log_scroll_offset,
+        app.commands.log_scroll_offset,
         area,
     );
 }
