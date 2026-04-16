@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod id;
 mod platform;
 mod process;
 mod ui;
