@@ -5,8 +5,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ServiceStatus, Tab};
+use crate::app::{App, Tab};
 use crate::commands::CommandStatus;
+use crate::services::ServiceStatus;
 use crate::tools::ToolKind;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -94,7 +95,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let running = app.running_count();
+    let running = app.services.running_count();
     let total = app.services.len();
 
     let tabs = Tabs::new(vec!["Services", "Commands", "Tools"])
@@ -141,6 +142,7 @@ fn draw_services(f: &mut Frame, app: &App, area: Rect) {
 
     let items: Vec<ListItem> = app
         .services
+        .items()
         .iter()
         .enumerate()
         .map(|(i, service)| {
@@ -183,7 +185,7 @@ fn draw_services(f: &mut Frame, app: &App, area: Rect) {
             let line = Line::from(spans);
 
             let item = ListItem::new(line);
-            if i == app.selected {
+            if i == app.services.selected_idx() {
                 item.style(
                     Style::default()
                         .bg(Color::DarkGray)
@@ -206,7 +208,7 @@ fn draw_services(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
-    let Some(service) = app.services.get(app.selected) else {
+    let Some(service) = app.services.items().get(app.services.selected_idx()) else {
         let empty = Paragraph::new("No services configured").block(
             Block::default()
                 .title(" Logs ")
@@ -220,7 +222,7 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
         f,
         &service.logs,
         format!(" {} ", service.config.name),
-        app.log_scroll_offset,
+        app.services.log_scroll_offset,
         area,
     );
 }

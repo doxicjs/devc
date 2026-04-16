@@ -6,6 +6,7 @@ mod id;
 mod platform;
 mod port_monitor;
 mod process;
+mod services;
 mod status;
 mod tools;
 mod ui;
@@ -166,8 +167,10 @@ fn run(
                     KeyCode::Enter => app.activate_selected(),
                     KeyCode::Char(' ') => {
                         if app.tab == app::Tab::Services {
-                            let idx = app.selected;
-                            app.open_service_url(idx);
+                            let idx = app.services.selected_idx();
+                            match app.services.open_url(idx) {
+                                Ok(msg) | Err(msg) => app.status.set(msg),
+                            }
                         }
                     }
                     KeyCode::PageUp => app.scroll_up(10),
