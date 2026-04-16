@@ -16,6 +16,7 @@ const STATUS_TTL: Duration = Duration::from_secs(3);
 use crate::config::Config;
 use crate::config::ServiceConfig;
 use crate::config::CommandConfig;
+use crate::id::{CommandId, ServiceId};
 use crate::process::ProcessHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub enum ServiceStatus {
 }
 
 pub struct ServiceState {
+    pub id: ServiceId,
     pub config: ServiceConfig,
     pub process: Option<ProcessHandle>,
     pub status: ServiceStatus,
@@ -46,6 +48,7 @@ pub enum CommandStatus {
 }
 
 pub struct CommandState {
+    pub id: CommandId,
     pub config: CommandConfig,
     pub process: Option<ProcessHandle>,
     pub status: CommandStatus,
@@ -134,6 +137,8 @@ pub struct App {
     pub tools_selected: usize,
     pub status: Option<(String, Instant)>,
     pub tick: u64,
+    next_service_id: u64,
+    next_command_id: u64,
     log_receiver: mpsc::Receiver<(LogSource, String)>,
     log_sender: mpsc::Sender<(LogSource, String)>,
     port_sender: mpsc::Sender<(usize, bool)>,
@@ -161,31 +166,41 @@ impl App {
         let (port_tx, port_rx) = mpsc::channel();
         let project_root = config_dir.join(&config.general.project_root);
 
+        let mut next_service_id: u64 = 0;
         let services: Vec<ServiceState> = config
             .services
             .into_iter()
-            .map(|cfg| ServiceState {
-                config: cfg,
-                process: None,
-                status: ServiceStatus::Stopped,
-                port_active: false,
-                stopping_since: None,
-                logs: VecDeque::with_capacity(LOG_CAPACITY),
-                config_dirty: false,
-                orphan: false,
+            .map(|cfg| {
+                next_service_id += 1;
+                ServiceState {
+                    id: ServiceId(next_service_id),
+                    config: cfg,
+                    process: None,
+                    status: ServiceStatus::Stopped,
+                    port_active: false,
+                    stopping_since: None,
+                    logs: VecDeque::with_capacity(LOG_CAPACITY),
+                    config_dirty: false,
+                    orphan: false,
+                }
             })
             .collect();
 
+        let mut next_command_id: u64 = 0;
         let commands: Vec<CommandState> = config
             .commands
             .into_iter()
-            .map(|cfg| CommandState {
-                config: cfg,
-                process: None,
-                status: CommandStatus::Idle,
-                logs: VecDeque::with_capacity(LOG_CAPACITY),
-                config_dirty: false,
-                orphan: false,
+            .map(|cfg| {
+                next_command_id += 1;
+                CommandState {
+                    id: CommandId(next_command_id),
+                    config: cfg,
+                    process: None,
+                    status: CommandStatus::Idle,
+                    logs: VecDeque::with_capacity(LOG_CAPACITY),
+                    config_dirty: false,
+                    orphan: false,
+                }
             })
             .collect();
 
@@ -225,6 +240,8 @@ impl App {
             tools_selected: 0,
             status: None,
             tick: 0,
+            next_service_id,
+            next_command_id,
             log_receiver: rx,
             log_sender: tx,
             port_sender: port_tx,
@@ -897,7 +914,9 @@ impl App {
         for cfg in new.services.iter() {
             let exists = self.services.iter().any(|s| s.config.name == cfg.name);
             if !exists {
+                self.next_service_id += 1;
                 self.services.push(ServiceState {
+                    id: ServiceId(self.next_service_id),
                     config: cfg.clone(),
                     process: None,
                     status: ServiceStatus::Stopped,
@@ -936,7 +955,9 @@ impl App {
                     }
                 } else {
                     // Fully reset so old completion icon + trailing logs disappear.
+                    let preserved_id = state.id;
                     *state = CommandState {
+                        id: preserved_id,
                         config: new_cfg.clone(),
                         process: None,
                         status: CommandStatus::Idle,
@@ -961,7 +982,9 @@ impl App {
         for cfg in new.commands.iter() {
             let exists = self.commands.iter().any(|c| c.config.name == cfg.name);
             if !exists {
+                self.next_command_id += 1;
                 self.commands.push(CommandState {
+                    id: CommandId(self.next_command_id),
                     config: cfg.clone(),
                     process: None,
                     status: CommandStatus::Idle,
