@@ -16,6 +16,7 @@ use crate::id::{CommandId, ServiceId};
 use crate::port_monitor::PortMonitor;
 use crate::process::ProcessHandle;
 use crate::status::StatusBar;
+use crate::tools::{ToolItem, ToolsPane};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceStatus {
@@ -60,17 +61,6 @@ pub enum Tab {
     Services = 0,
     Commands = 1,
     Tools = 2,
-}
-
-pub enum ToolKind {
-    Link(String),
-    Copy(String),
-}
-
-pub struct ToolItem {
-    pub name: String,
-    pub key: char,
-    pub kind: ToolKind,
 }
 
 /// Log messages are tagged with a source: Service(id) or Command(id)
@@ -131,8 +121,7 @@ pub struct App {
     pub commands_selected: usize,
     pub selected: usize,
     pub tab: Tab,
-    pub tools: Vec<ToolItem>,
-    pub tools_selected: usize,
+    pub tools: ToolsPane,
     pub status: StatusBar,
     pub tick: u64,
     next_service_id: u64,
@@ -195,23 +184,9 @@ impl App {
             })
             .collect();
 
-        let mut tools: Vec<ToolItem> = Vec::new();
-        for link in config.links {
-            tools.push(ToolItem {
-                key: link.key.chars().next().unwrap_or('?'),
-                name: link.name,
-                kind: ToolKind::Link(link.url),
-            });
-        }
-        for copy in config.copies {
-            tools.push(ToolItem {
-                key: copy.key.chars().next().unwrap_or('?'),
-                name: copy.name,
-                kind: ToolKind::Copy(copy.text),
-            });
-        }
+        let tools = ToolsPane::from_config(config.links, config.copies);
 
-        for warning in detect_key_conflicts(&services, &commands, &tools) {
+        for warning in detect_key_conflicts(&services, &commands, tools.items()) {
             eprintln!("warning: {}", warning);
         }
 
@@ -222,7 +197,6 @@ impl App {
             selected: 0,
             tab: Tab::Services,
             tools,
-            tools_selected: 0,
             status: StatusBar::new(),
             tick: 0,
             next_service_id,
@@ -274,7 +248,7 @@ impl App {
                     self.cmd_log_scroll_offset = 0;
                 }
             }
-            Tab::Tools => self.tools_selected = self.tools_selected.saturating_sub(1),
+            Tab::Tools => self.tools.select_up(),
         }
     }
 
@@ -292,11 +266,7 @@ impl App {
                     self.cmd_log_scroll_offset = 0;
                 }
             }
-            Tab::Tools => {
-                if self.tools_selected + 1 < self.tools.len() {
-                    self.tools_selected += 1;
-                }
-            }
+            Tab::Tools => self.tools.select_down(),
         }
     }
 
@@ -347,8 +317,11 @@ impl App {
                 self.run_command(idx);
             }
             Tab::Tools => {
-                let idx = self.tools_selected;
-                self.activate_tool(idx);
+                let idx = self.tools.selected_idx();
+                match self.tools.activate(idx) {
+                    Ok(msg) => self.status.set(msg),
+                    Err(msg) => self.status.set(msg),
+                }
             }
         }
     }
@@ -536,39 +509,6 @@ impl App {
             .position(|c| c.config.key_char().to_ascii_lowercase() == key_lower)
     }
 
-    // --- Tools ---
-
-    pub fn find_tool_by_key(&self, key: char) -> Option<usize> {
-        let key_lower = key.to_ascii_lowercase();
-        self.tools
-            .iter()
-            .position(|t| t.key.to_ascii_lowercase() == key_lower)
-    }
-
-    pub fn activate_tool(&mut self, idx: usize) {
-        let Some(tool) = self.tools.get(idx) else {
-            return;
-        };
-
-        match &tool.kind {
-            ToolKind::Link(url) => {
-                let url = url.clone();
-                match crate::platform::open_url(&url) {
-                    Ok(_) => self.status.set(format!("Opened: {}", url)),
-                    Err(e) => self.status.set(format!("Error: {}", e)),
-                }
-            }
-            ToolKind::Copy(text) => {
-                let text = text.clone();
-                let name = tool.name.clone();
-                match crate::platform::copy_to_clipboard(&text) {
-                    Ok(_) => self.status.set(format!("Copied: {}", name)),
-                    Err(e) => self.status.set(format!("Error: {}", e)),
-                }
-            }
-        }
-    }
-
     pub fn handle_char(&mut self, c: char) {
         match self.tab {
             Tab::Services => match c {
@@ -586,8 +526,11 @@ impl App {
                 }
             }
             Tab::Tools => {
-                if let Some(idx) = self.find_tool_by_key(c) {
-                    self.activate_tool(idx);
+                if let Some(idx) = self.tools.find_by_key(c) {
+                    match self.tools.activate(idx) {
+                        Ok(msg) => self.status.set(msg),
+                        Err(msg) => self.status.set(msg),
+                    }
                 }
             }
         }
@@ -890,27 +833,7 @@ impl App {
         }
 
         // ----- Tools (full silent rebuild — no background threads) -----
-        let mut tools: Vec<ToolItem> = Vec::new();
-        for link in new.links.iter() {
-            tools.push(ToolItem {
-                key: link.key.chars().next().unwrap_or('?'),
-                name: link.name.clone(),
-                kind: ToolKind::Link(link.url.clone()),
-            });
-        }
-        for c in new.copies.iter() {
-            tools.push(ToolItem {
-                key: c.key.chars().next().unwrap_or('?'),
-                name: c.name.clone(),
-                kind: ToolKind::Copy(c.text.clone()),
-            });
-        }
-        self.tools = tools;
-        if self.tools.is_empty() {
-            self.tools_selected = 0;
-        } else if self.tools_selected >= self.tools.len() {
-            self.tools_selected = self.tools.len() - 1;
-        }
+        self.tools.rebuild(&new.links, &new.copies);
 
         // ----- Project root (no mutation) -----
         let new_root = self.config_dir.join(&new.general.project_root);
@@ -919,7 +842,7 @@ impl App {
         }
 
         // ----- Key conflicts -----
-        report.key_conflicts = detect_key_conflicts(&self.services, &self.commands, &self.tools);
+        report.key_conflicts = detect_key_conflicts(&self.services, &self.commands, self.tools.items());
 
         report
     }
@@ -1839,11 +1762,14 @@ mod planned_api_tests {
             vec![],
         );
         app.apply_config(pre);
-        app.tools_selected = 2;
+        // Manually set internal selected to 2 via select_down twice
+        app.tab = crate::app::Tab::Tools;
+        app.select_down();
+        app.select_down();
         let new = config_with(vec![], vec![], vec![link("A", "a", "u1")], vec![]);
         app.apply_config(new);
         assert_eq!(app.tools.len(), 1);
-        assert_eq!(app.tools_selected, 0);
+        assert_eq!(app.tools.selected_idx(), 0);
     }
 
     #[test]

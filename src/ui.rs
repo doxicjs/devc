@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, CommandStatus, ServiceStatus, Tab, ToolKind};
+use crate::app::{App, CommandStatus, ServiceStatus, Tab};
+use crate::tools::ToolKind;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -305,6 +306,7 @@ fn draw_command_logs(f: &mut Frame, app: &App, area: Rect) {
 fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .tools
+        .items()
         .iter()
         .enumerate()
         .map(|(i, tool)| {
@@ -327,7 +329,7 @@ fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
             ]);
 
             let item = ListItem::new(line);
-            if i == app.tools_selected {
+            if i == app.tools.selected_idx() {
                 item.style(
                     Style::default()
                         .bg(Color::DarkGray)
@@ -350,7 +352,7 @@ fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tool_detail(f: &mut Frame, app: &App, area: Rect) {
-    let Some(tool) = app.tools.get(app.tools_selected) else {
+    let Some(tool) = app.tools.items().get(app.tools.selected_idx()) else {
         let empty = Paragraph::new("No tools configured").block(
             Block::default()
                 .title(" Detail ")

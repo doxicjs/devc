@@ -6,6 +6,7 @@ mod platform;
 mod port_monitor;
 mod process;
 mod status;
+mod tools;
 mod ui;
 
 use std::io;
