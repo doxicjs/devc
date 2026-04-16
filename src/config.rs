@@ -1,6 +1,7 @@
 use serde::Deserialize;
+use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub general: General,
@@ -18,7 +19,7 @@ fn default_project_root() -> String {
     "./".to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct General {
     #[serde(default = "default_project_root")]
     pub project_root: String,
@@ -32,7 +33,7 @@ impl Default for General {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
@@ -77,7 +78,7 @@ impl ServiceConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandConfig {
     pub name: String,
@@ -92,7 +93,7 @@ impl CommandConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkConfig {
     pub name: String,
@@ -100,7 +101,7 @@ pub struct LinkConfig {
     pub url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CopyConfig {
     pub name: String,
@@ -108,7 +109,7 @@ pub struct CopyConfig {
     pub text: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LocalConfig {
     #[serde(default)]
     pub general: Option<LocalGeneral>,
@@ -122,13 +123,32 @@ pub struct LocalConfig {
     pub copies: Vec<CopyConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LocalGeneral {
     #[serde(default)]
     pub project_root: Option<String>,
 }
 
 impl Config {
+    pub fn load(main: &Path, local: Option<&Path>) -> Result<Self, String> {
+        let main_str = std::fs::read_to_string(main)
+            .map_err(|e| format!("Failed to read config '{}': {}", main.display(), e))?;
+        let mut config: Config = toml::from_str(&main_str)
+            .map_err(|e| format!("Failed to parse config: {}", e))?;
+        if let Some(local_path) = local {
+            if local_path.exists() {
+                let local_str = std::fs::read_to_string(local_path).map_err(|e| {
+                    format!("Failed to read local config '{}': {}", local_path.display(), e)
+                })?;
+                let local_cfg: LocalConfig = toml::from_str(&local_str).map_err(|e| {
+                    format!("Failed to parse local config '{}': {}", local_path.display(), e)
+                })?;
+                config.merge_local(local_cfg);
+            }
+        }
+        Ok(config)
+    }
+
     pub fn merge_local(&mut self, local: LocalConfig) {
         if let Some(general) = local.general {
             if let Some(project_root) = general.project_root {

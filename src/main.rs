@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::App;
-use config::{Config, LocalConfig};
+use config::Config;
 
 const INSTALL_URL: &str = "https://raw.githubusercontent.com/doxicjs/devc/main/install.sh";
 
@@ -72,26 +72,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
 
-    let config_str = std::fs::read_to_string(&config_path)?;
-    let mut config: Config =
-        toml::from_str(&config_str).map_err(|e| format!("Failed to parse config: {}", e))?;
-
-    if let Some(local_path) = local_config_path(&config_path) {
-        if local_path.exists() {
-            let local_str = std::fs::read_to_string(&local_path)?;
-            let local: LocalConfig = toml::from_str(&local_str).map_err(|e| {
-                format!("Failed to parse local config '{}': {}", local_path.display(), e)
-            })?;
-            config.merge_local(local);
-        }
-    }
+    let local_path = local_config_path(&config_path);
+    let config = Config::load(&config_path, local_path.as_deref())?;
 
     if config.services.is_empty() && config.commands.is_empty() {
         eprintln!("No services or commands defined in config");
         return Ok(());
     }
 
-    let mut app = App::new(config, config_dir);
+    let mut app = App::new(config, config_dir, config_path, local_path);
 
     // Handle SIGINT/SIGTERM so cleanup() runs before exit.
     // Uses libc directly (no extra deps) — the handler only touches an AtomicBool,
@@ -146,6 +135,8 @@ fn run(
         }
 
         app.tick();
+        app.check_config_reload();
+        app.compact_stopped_orphans();
         app.poll_logs();
         app.check_processes();
         app.check_ports();
