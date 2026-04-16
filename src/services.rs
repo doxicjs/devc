@@ -406,7 +406,6 @@ fn service_config_changed(a: &ServiceConfig, b: &ServiceConfig) -> bool {
         || a.url != b.url
         || a.depends_on != b.depends_on
         || a.key != b.key
-        || a.service_type != b.service_type
 }
 
 #[cfg(test)]
@@ -419,7 +418,6 @@ mod tests {
             key: key.into(),
             command: format!("echo {}", name),
             working_dir: "./".into(),
-            service_type: "generic".into(),
             port,
             url: None,
             depends_on: vec![],

@@ -471,7 +471,6 @@ mod tests {
             key: key.to_string(),
             command: format!("echo {}", name),
             working_dir: "./".to_string(),
-            service_type: "generic".to_string(),
             port: None,
             url: None,
             depends_on: vec![],

@@ -66,7 +66,6 @@ name = "API"
 key = "a"
 command = "docker compose up"
 working_dir = "api"
-service_type = "backend"
 url = "http://localhost:3000/"
 depends_on = []
 
@@ -76,7 +75,6 @@ key = "w"
 port = 5173
 command = "pnpm dev"
 working_dir = "web"
-service_type = "frontend"
 depends_on = ["API"]
 
 [[commands]]
@@ -104,7 +102,6 @@ text = "your-api-key"
 | `key`          | yes      | Single-character shortcut to toggle the service       |
 | `command`      | yes      | Shell command to start the service                   |
 | `working_dir`  | yes      | Working directory (relative to `project_root`)       |
-| `service_type` | yes      | Type label (e.g. `backend`, `frontend`)              |
 | `port`         | no       | Port to monitor (1–65535); shown in service list      |
 | `url`          | no       | URL to open with `Space` (defaults to `localhost:port`) |
 | `depends_on`   | no       | Array of service names to start first                |
@@ -145,14 +142,12 @@ name = "Scratch"
 key = "s"
 command = "pnpm dev:scratch"
 working_dir = "scratch"
-service_type = "backend"
 
 [[services]]
 name = "Web"                      # same name as in devc.toml — overrides
 key = "w"
 command = "pnpm dev --inspect"
 working_dir = "web"
-service_type = "frontend"
 port = 5173
 
 [[links]]

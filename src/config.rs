@@ -40,8 +40,6 @@ pub struct ServiceConfig {
     pub key: String,
     pub command: String,
     pub working_dir: String,
-    #[allow(dead_code)]
-    pub service_type: String,
     #[serde(default, deserialize_with = "deserialize_port")]
     pub port: Option<u16>,
     pub url: Option<String>,
@@ -186,7 +184,6 @@ mod tests {
             key: key.to_string(),
             command: format!("echo {}", name),
             working_dir: "./".to_string(),
-            service_type: "generic".to_string(),
             port,
             url: None,
             depends_on: vec![],
@@ -199,7 +196,6 @@ mod tests {
             key: key.to_string(),
             command: command.to_string(),
             working_dir: ".".to_string(),
-            service_type: "backend".to_string(),
             port: None,
             url: None,
             depends_on: vec![],
@@ -372,7 +368,6 @@ name = "web"
 key = "w"
 command = "echo hi"
 working_dir = "./"
-service_type = "node"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.services[0].depends_on.is_empty());
@@ -386,10 +381,25 @@ name = "web"
 key = "w"
 command = "echo hi"
 working_dir = "./"
-service_type = "node"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.project_root, "./");
+    }
+
+    // ===== service_type removal =====
+
+    #[test]
+    fn service_type_field_is_rejected() {
+        let toml_str = r#"
+[[services]]
+name = "web"
+key = "w"
+command = "echo hi"
+working_dir = "./"
+service_type = "node"
+"#;
+        let config: Result<Config, _> = toml::from_str(toml_str);
+        assert!(config.is_err(), "service_type should now be an unknown field");
     }
 
     // ===== Fix 2: deny_unknown_fields catches typos =====
@@ -402,7 +412,6 @@ name = "web"
 key = "w"
 command = "echo hi"
 working_dir = "./"
-service_type = "node"
 poort = 3000
 "#;
         let config: Result<Config, _> = toml::from_str(toml_str);
@@ -432,7 +441,6 @@ name = "web"
 key = "w"
 command = "echo hi"
 working_dir = "./"
-service_type = "node"
 port = 0
 "#;
         let config: Result<Config, _> = toml::from_str(toml_str);
