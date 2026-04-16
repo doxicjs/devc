@@ -1,13 +1,10 @@
 use std::collections::VecDeque;
-use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Max lines kept per service/command log buffer (oldest evicted first).
 const LOG_CAPACITY: usize = 500;
-/// How often to check ports, in ticks. At 100ms/tick this is ~2 seconds.
-const PORT_CHECK_INTERVAL: u64 = 20;
 /// Seconds to wait after SIGTERM before escalating to SIGKILL.
 const KILL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -15,6 +12,7 @@ use crate::config::Config;
 use crate::config::ServiceConfig;
 use crate::config::CommandConfig;
 use crate::id::{CommandId, ServiceId};
+use crate::port_monitor::PortMonitor;
 use crate::process::ProcessHandle;
 use crate::status::StatusBar;
 
@@ -140,8 +138,7 @@ pub struct App {
     next_command_id: u64,
     log_receiver: mpsc::Receiver<(LogSource, String)>,
     log_sender: mpsc::Sender<(LogSource, String)>,
-    port_sender: mpsc::Sender<(usize, bool)>,
-    port_receiver: mpsc::Receiver<(usize, bool)>,
+    port_monitor: PortMonitor,
     project_root: PathBuf,
     config_dir: PathBuf,
     config_path: PathBuf,
@@ -162,7 +159,6 @@ impl App {
         local_config_path: Option<PathBuf>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
-        let (port_tx, port_rx) = mpsc::channel();
         let project_root = config_dir.join(&config.general.project_root);
 
         let mut next_service_id: u64 = 0;
@@ -243,8 +239,7 @@ impl App {
             next_command_id,
             log_receiver: rx,
             log_sender: tx,
-            port_sender: port_tx,
-            port_receiver: port_rx,
+            port_monitor: PortMonitor::new(),
             project_root,
             config_dir,
             config_path,
@@ -710,43 +705,20 @@ impl App {
     }
 
     pub fn check_ports(&mut self) {
-        // Poll results from previous checks
-        while let Ok((idx, active)) = self.port_receiver.try_recv() {
-            if let Some(service) = self.services.get_mut(idx) {
-                service.port_active = active;
+        for (id, active) in self.port_monitor.drain() {
+            if let Some(s) = self.services.iter_mut().find(|s| s.id == id) {
+                s.port_active = active;
             }
         }
-
-        if self.tick % PORT_CHECK_INTERVAL != 1 {
+        if !self.port_monitor.should_check(self.tick) {
             return;
         }
-
-        // Collect all ports to check, then spawn ONE thread for the batch
-        let checks: Vec<(usize, u16)> = self
+        let targets: Vec<(ServiceId, u16)> = self
             .services
             .iter()
-            .enumerate()
-            .filter_map(|(idx, s)| s.config.port.map(|p| (idx, p)))
+            .filter_map(|s| s.config.port.map(|p| (s.id, p)))
             .collect();
-
-        if checks.is_empty() {
-            return;
-        }
-
-        let sender = self.port_sender.clone();
-        std::thread::spawn(move || {
-            let timeout = Duration::from_millis(50);
-            for (idx, port) in checks {
-                let addrs: [SocketAddr; 2] = [
-                    format!("127.0.0.1:{}", port).parse().unwrap(),
-                    format!("[::1]:{}", port).parse().unwrap(),
-                ];
-                let active = addrs
-                    .iter()
-                    .any(|addr| TcpStream::connect_timeout(addr, timeout).is_ok());
-                let _ = sender.send((idx, active));
-            }
-        });
+        self.port_monitor.kick(targets);
     }
 
     pub fn cleanup(&mut self) {

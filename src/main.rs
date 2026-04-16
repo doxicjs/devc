@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod id;
 mod platform;
+mod port_monitor;
 mod process;
 mod status;
 mod ui;
