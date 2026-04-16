@@ -29,7 +29,9 @@ impl ToolsPane {
 
     pub fn items(&self) -> &[ToolItem] { &self.items }
     pub fn selected_idx(&self) -> usize { self.selected }
+    #[allow(dead_code)]
     pub fn len(&self) -> usize { self.items.len() }
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool { self.items.is_empty() }
 
     pub fn select_up(&mut self) {

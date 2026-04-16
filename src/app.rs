@@ -219,41 +219,9 @@ impl App {
         }
     }
 
-    // --- Tick ---
-
-    pub fn tick(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
-    }
-
-    pub fn poll_logs(&mut self) {
-        self.services.poll_logs();
-        self.commands.poll_logs();
-    }
-
-    pub fn check_processes(&mut self) {
-        self.services.check_processes();
-        self.commands.check_processes();
-    }
-
-    pub fn check_ports(&mut self) {
-        self.services.apply_ports(&self.port_monitor.drain());
-        if !self.port_monitor.should_check(self.tick) {
-            return;
-        }
-        self.port_monitor.kick(self.services.port_targets());
-    }
-
     pub fn cleanup(&mut self) {
         self.services.cleanup();
         self.commands.cleanup();
-    }
-
-    /// Tail-compact services and commands whose `orphan` flag is set and that have
-    /// fully stopped (no process, status Stopped/Idle/Done/Failed). Called every tick
-    /// so an orphan disappears as soon as the user stops it — no config-edit nudge needed.
-    pub fn compact_stopped_orphans(&mut self) {
-        self.services.compact_stopped_orphans();
-        self.commands.compact_stopped_orphans();
     }
 
     pub fn poll(&mut self) {
@@ -618,7 +586,7 @@ mod tests {
     fn tick_increments() {
         let mut app = empty_app();
         assert_eq!(app.tick, 0);
-        app.tick();
+        app.tick = app.tick.wrapping_add(1);
         assert_eq!(app.tick, 1);
     }
 
@@ -626,7 +594,7 @@ mod tests {
     fn tick_wraps_at_max() {
         let mut app = empty_app();
         app.tick = u64::MAX;
-        app.tick();
+        app.tick = app.tick.wrapping_add(1);
         assert_eq!(app.tick, 0);
     }
 
@@ -675,13 +643,15 @@ mod tests {
         let mut app = empty_app();
         // ServicesPane owns its channel; send via the log_tx which is private.
         // We can't send directly, but poll_logs should be a no-op with empty channel.
-        app.poll_logs();
+        app.services.poll_logs();
+        app.commands.poll_logs();
     }
 
     #[test]
     fn poll_logs_invalid_command_index_no_panic() {
         let mut app = empty_app();
-        app.poll_logs();
+        app.services.poll_logs();
+        app.commands.poll_logs();
     }
 
     // ===== Log capping at 500 =====
@@ -794,8 +764,10 @@ mod tests {
         assert_eq!(app.commands[0].status, CommandStatus::Running);
         // Wait for command to finish
         std::thread::sleep(std::time::Duration::from_millis(500));
-        app.poll_logs();
-        app.check_processes();
+        app.services.poll_logs();
+        app.commands.poll_logs();
+        app.services.check_processes();
+        app.commands.check_processes();
         assert_eq!(app.commands[0].status, CommandStatus::Done);
         // Should have the "done" marker
         assert!(app.commands[0].logs.iter().any(|l| l.contains("done")));
@@ -807,8 +779,10 @@ mod tests {
         let root = app.project_root.clone();
         app.commands.run(0, &root);
         std::thread::sleep(std::time::Duration::from_millis(500));
-        app.poll_logs();
-        app.check_processes();
+        app.services.poll_logs();
+        app.commands.poll_logs();
+        app.services.check_processes();
+        app.commands.check_processes();
         assert_eq!(app.commands[0].status, CommandStatus::Failed);
     }
 
@@ -818,7 +792,8 @@ mod tests {
         let root = app.project_root.clone();
         app.commands.run(0, &root);
         std::thread::sleep(std::time::Duration::from_millis(500));
-        app.poll_logs();
+        app.services.poll_logs();
+        app.commands.poll_logs();
         assert!(
             app.commands[0].logs.iter().any(|l| l.contains("hello_world")),
             "Command output should be collected in logs"
@@ -1032,7 +1007,6 @@ mod planned_api_tests {
     #[test]
     fn select_up_resets_scroll() {
         let mut app = app_with(vec![svc("a", "a"), svc("b", "b")], vec![]);
-        app.services[1].status; // just access to verify indexing works
         // set selected to 1 via select_down
         app.select_down();
         app.services.log_scroll_offset = 15;
@@ -1381,7 +1355,8 @@ mod planned_api_tests {
         // User stops Web (simulate)
         app.services[1].status = ServiceStatus::Stopped;
         app.services[1].process = None;
-        app.compact_stopped_orphans();
+        app.services.compact_stopped_orphans();
+        app.commands.compact_stopped_orphans();
         assert_eq!(app.services.len(), 1, "stopped orphan should auto-drop from tail");
         assert_eq!(app.services[0].config.name, "API");
     }
@@ -1392,7 +1367,8 @@ mod planned_api_tests {
         app.services[1].status = ServiceStatus::Running;
         app.apply_config(config_with(vec![svc("API", "a")], vec![], vec![], vec![]));
         // Web still Running; compact should be a no-op
-        app.compact_stopped_orphans();
+        app.services.compact_stopped_orphans();
+        app.commands.compact_stopped_orphans();
         assert_eq!(app.services.len(), 2);
     }
 
@@ -1400,7 +1376,8 @@ mod planned_api_tests {
     fn compact_stopped_orphans_does_not_drop_non_orphan_stopped() {
         let mut app = app_with(vec![svc("API", "a"), svc("Web", "w")], vec![]);
         // Web is stopped but NOT an orphan (still in config)
-        app.compact_stopped_orphans();
+        app.services.compact_stopped_orphans();
+        app.commands.compact_stopped_orphans();
         assert_eq!(app.services.len(), 2, "stopped non-orphan services stay");
     }
 
@@ -1414,7 +1391,8 @@ mod planned_api_tests {
         // Command finishes
         app.commands[1].status = CommandStatus::Done;
         app.commands[1].process = None;
-        app.compact_stopped_orphans();
+        app.services.compact_stopped_orphans();
+        app.commands.compact_stopped_orphans();
         assert_eq!(app.commands.len(), 1);
     }
 }
