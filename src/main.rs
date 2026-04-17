@@ -1,7 +1,15 @@
 mod app;
+mod commands;
 mod config;
+mod config_watcher;
+mod id;
+mod keys;
 mod platform;
+mod port_monitor;
 mod process;
+mod services;
+mod status;
+mod tools;
 mod ui;
 
 use std::io;
@@ -9,7 +17,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -21,6 +31,26 @@ use app::App;
 use config::Config;
 
 const INSTALL_URL: &str = "https://raw.githubusercontent.com/doxicjs/devc/main/install.sh";
+
+/// RAII guard: enables raw mode + alt screen + mouse capture on `enter`, and
+/// restores the terminal on drop — including on panic — so users are never
+/// stranded in an unusable terminal state.
+struct RawTerminal;
+
+impl RawTerminal {
+    fn enter() -> Result<Self, Box<dyn std::error::Error>> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -92,21 +122,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     unsafe {
-        libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = signal_handler as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
     }
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let result = {
+        let _guard = RawTerminal::enter()?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend)?;
+        let r = run(&mut terminal, &mut app, &RUNNING);
+        app.cleanup();
+        r
+        // _guard drops here — raw mode, alt-screen, and mouse capture are
+        // all restored before we print anything else, even on panic.
+    };
 
-    let result = run(&mut terminal, &mut app, &RUNNING);
-
-    app.cleanup();
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    if !app.conflicts.is_empty() {
+        eprintln!();
+        for warning in &app.conflicts {
+            eprintln!("warning: {}", warning);
+        }
+    }
 
     result
 }
@@ -134,43 +174,46 @@ fn run(
             break;
         }
 
-        app.tick();
-        app.check_config_reload();
-        app.compact_stopped_orphans();
-        app.poll_logs();
-        app.check_processes();
-        app.check_ports();
-        app.clear_old_status();
+        app.poll();
 
         terminal.draw(|f| ui::draw(f, app))?;
 
         // 100ms poll = ~10fps render + tick rate for spinners and port checks
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Tab => app.next_tab(),
-                    KeyCode::BackTab => app.prev_tab(),
-                    KeyCode::Up | KeyCode::Char('k') => app.select_up(),
-                    KeyCode::Down | KeyCode::Char('j') => app.select_down(),
-                    KeyCode::Enter => app.activate_selected(),
-                    KeyCode::Char(' ') => {
-                        if app.tab == app::Tab::Services {
-                            let idx = app.selected;
-                            app.open_service_url(idx);
-                        }
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyCode::PageUp => app.scroll_up(10),
-                    KeyCode::PageDown => app.scroll_down(10),
-                    KeyCode::Home => app.scroll_up(usize::MAX / 2),
-                    KeyCode::End => app.scroll_to_bottom(),
-                    KeyCode::Char(c) => app.handle_char(c),
-                    _ => {}
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Tab => app.next_tab(),
+                        KeyCode::BackTab => app.prev_tab(),
+                        KeyCode::Up | KeyCode::Char('k') => app.select_up(),
+                        KeyCode::Down | KeyCode::Char('j') => app.select_down(),
+                        KeyCode::Enter => app.activate_selected(),
+                        KeyCode::Char(' ') => {
+                            if app.tab == app::Tab::Services {
+                                let idx = app.services.selected_idx();
+                                match app.services.open_url(idx) {
+                                    Ok(msg) | Err(msg) => app.status.set(msg),
+                                }
+                            }
+                        }
+                        KeyCode::PageUp => app.scroll_up(10),
+                        KeyCode::PageDown => app.scroll_down(10),
+                        KeyCode::Home => app.scroll_up(usize::MAX / 2),
+                        KeyCode::End => app.scroll_to_bottom(),
+                        KeyCode::Char(c) => app.handle_char(c),
+                        _ => {}
+                    }
                 }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_up(1),
+                    MouseEventKind::ScrollDown => app.scroll_down(1),
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
