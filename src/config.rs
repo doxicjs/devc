@@ -70,10 +70,6 @@ impl ServiceConfig {
             .clone()
             .or_else(|| self.port.map(|p| format!("http://localhost:{}/", p)))
     }
-
-    pub fn full_command(&self) -> String {
-        self.command.clone()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,24 +270,6 @@ text = "abc123"
         assert!(c.commands.is_empty());
         assert_eq!(c.links.len(), 1);
         assert_eq!(c.copies.len(), 1);
-    }
-
-    // ===== Issue #5: full_command should NOT auto-append --port =====
-
-    #[test]
-    fn full_command_does_not_append_port() {
-        let svc = service("web", "w", Some(3000));
-        assert_eq!(
-            svc.full_command(),
-            "echo web",
-            "full_command() should return command as-is, not append --port"
-        );
-    }
-
-    #[test]
-    fn full_command_without_port_returns_as_is() {
-        let svc = service("worker", "k", None);
-        assert_eq!(svc.full_command(), "echo worker");
     }
 
     // ===== key_char edge cases =====

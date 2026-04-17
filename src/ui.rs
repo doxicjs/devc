@@ -123,18 +123,44 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     };
     let right_width = (right_text.chars().count() as u16).max(16);
 
+    let conflict_text = if app.conflicts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            " ⚠ {} conflict{} ",
+            app.conflicts.len(),
+            if app.conflicts.len() == 1 { "" } else { "s" },
+        ))
+    };
+    let conflict_width = conflict_text
+        .as_ref()
+        .map(|t| t.chars().count() as u16)
+        .unwrap_or(0);
+
     let header_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(right_width)])
+        .constraints([
+            Constraint::Min(20),
+            Constraint::Length(conflict_width),
+            Constraint::Length(right_width),
+        ])
         .split(area);
 
     f.render_widget(tabs, header_layout[0]);
+
+    if let Some(text) = conflict_text {
+        let badge = Paragraph::new(Line::from(vec![Span::styled(
+            text,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]));
+        f.render_widget(badge, header_layout[1]);
+    }
 
     let status = Paragraph::new(Line::from(vec![Span::styled(
         right_text,
         Style::default().fg(right_color),
     )]));
-    f.render_widget(status, header_layout[1]);
+    f.render_widget(status, header_layout[2]);
 }
 
 fn draw_services(f: &mut Frame, app: &App, area: Rect) {
@@ -600,5 +626,41 @@ mod tests {
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn header_shows_conflict_badge_when_conflicts_present() {
+        // Two services bound to 'w' → duplicate-key conflict detected at construction.
+        let config = make_config(vec![svc("A", "w"), svc("B", "w")], vec![]);
+        let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
+        assert!(!app.conflicts.is_empty());
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let header: String = (0..buf.area.width)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol()).unwrap_or("").to_string())
+            .collect();
+        assert!(header.contains("⚠"), "header should show warning glyph, got: {:?}", header);
+        assert!(header.contains("conflict"), "header should mention conflicts, got: {:?}", header);
+    }
+
+    #[test]
+    fn header_hides_conflict_badge_when_clean() {
+        let config = make_config(vec![svc("A", "a"), svc("B", "b")], vec![]);
+        let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
+        assert!(app.conflicts.is_empty());
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let header: String = (0..buf.area.width)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol()).unwrap_or("").to_string())
+            .collect();
+        assert!(!header.contains("⚠"), "clean config must not show the badge, got: {:?}", header);
     }
 }

@@ -79,6 +79,7 @@ pub struct App {
     pub tick: u64,
     pub project_root: PathBuf,
     pub config_dir: PathBuf,
+    pub conflicts: Vec<String>,
 }
 
 impl App {
@@ -94,9 +95,7 @@ impl App {
         let commands = CommandsPane::from_config(config.commands);
         let tools = ToolsPane::from_config(config.links, config.copies);
 
-        for warning in crate::keys::detect_conflicts(services.items(), commands.items(), tools.items()) {
-            eprintln!("warning: {}", warning);
-        }
+        let conflicts = crate::keys::detect_conflicts(services.items(), commands.items(), tools.items());
 
         Self {
             services,
@@ -109,6 +108,7 @@ impl App {
             tick: 0,
             project_root,
             config_dir,
+            conflicts,
         }
     }
 
@@ -194,7 +194,6 @@ impl App {
     pub fn handle_char(&mut self, c: char) {
         match self.tab {
             Tab::Services => match c {
-                'a' => self.services.start_all(&self.project_root),
                 'x' => self.services.stop_all(),
                 _ => {
                     if crate::keys::is_services_reserved(c) { return; }
@@ -279,9 +278,10 @@ impl App {
         }
 
         // ----- Key conflicts -----
-        report.key_conflicts = crate::keys::detect_conflicts(
+        self.conflicts = crate::keys::detect_conflicts(
             self.services.items(), self.commands.items(), self.tools.items(),
         );
+        report.key_conflicts = self.conflicts.clone();
 
         report
     }
@@ -558,16 +558,14 @@ mod tests {
         assert_eq!(app.services.running_count(), 0);
     }
 
-    // ===== handle_char: reserved key behavior (Issue #6) =====
+    // ===== handle_char: reserved key behavior =====
 
     #[test]
-    fn handle_char_a_triggers_start_all_not_service_key() {
-        // Service keyed 'a' — pressing 'a' goes through start_all() path,
-        // not the direct key-lookup path. This documents the conflict.
+    fn handle_char_a_is_usable_service_binding() {
+        // 'a' is no longer reserved — pressing it should toggle a service
+        // bound to 'a' directly.
         let mut app = app_with(vec![svc("alpha", "a", None)], vec![]);
         app.handle_char('a');
-        // start_all calls toggle for each stopped service, so the
-        // service still gets started — but through start_all, not direct toggle.
         assert_ne!(app.services[0].status, ServiceStatus::Stopped);
     }
 
@@ -1187,6 +1185,33 @@ mod planned_api_tests {
         );
         let report = app.apply_config(new);
         assert!(!report.key_conflicts.is_empty(), "expected conflicts: {:?}", report.key_conflicts);
+        assert_eq!(
+            app.conflicts, report.key_conflicts,
+            "app.conflicts must mirror the reload report for the sticky badge",
+        );
+    }
+
+    #[test]
+    fn new_populates_conflicts_at_startup() {
+        let app = app_with(vec![svc("A", "w"), svc("B", "w")], vec![]);
+        assert!(
+            !app.conflicts.is_empty(),
+            "duplicate keys at startup must populate app.conflicts",
+        );
+    }
+
+    #[test]
+    fn apply_config_clears_conflicts_when_resolved() {
+        let mut app = app_with(vec![svc("A", "w"), svc("B", "w")], vec![]);
+        assert!(!app.conflicts.is_empty());
+        let new = config_with(
+            vec![svc("A", "w"), svc("B", "b")],  // distinct keys
+            vec![],
+            vec![],
+            vec![],
+        );
+        app.apply_config(new);
+        assert!(app.conflicts.is_empty(), "fixing keys must clear the sticky badge");
     }
 
     #[test]

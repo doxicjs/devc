@@ -120,14 +120,6 @@ impl ServicesPane {
         self.toggle(idx, project_root);
     }
 
-    pub fn start_all(&mut self, project_root: &Path) {
-        for i in 0..self.items.len() {
-            if self.items[i].status == ServiceStatus::Stopped {
-                self.toggle(i, project_root);
-            }
-        }
-    }
-
     pub fn stop_all(&mut self) {
         for i in 0..self.items.len() {
             if self.items[i].status == ServiceStatus::Running {
@@ -371,7 +363,7 @@ impl ServicesPane {
         service.config_dirty = false;
 
         let working_dir = project_root.join(&service.config.working_dir);
-        let cmd = service.config.full_command();
+        let cmd = service.config.command.clone();
         service.logs.push_back(format!("── starting: {} ──", cmd));
 
         let service_id = service.id;

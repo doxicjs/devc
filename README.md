@@ -33,11 +33,10 @@ devc -u               # update to latest
 | `↑↓` / `jk`     | Navigate                                |
 | `Enter`          | Activate selected item                  |
 | `Space`          | Open service URL in browser             |
-| `a`              | Start all services                      |
-| `x`              | Stop all services                       |
+| `x`              | Stop all services (Services tab)        |
 | `q`              | Quit                                    |
 
-Services, commands, and tools also have their own shortcut keys defined in `devc.toml`.
+Services, commands, and tools also have their own shortcut keys defined in `devc.toml`. The keys `q`, `j`, `k`, and `space` are consumed by the UI on every tab, so don't bind them. `x` is only reserved on the Services tab — you can use it as a command or tool binding.
 
 ### Default Behaviors
 
