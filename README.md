@@ -33,11 +33,10 @@ devc -u               # update to latest
 | `↑↓` / `jk`     | Navigate                                |
 | `Enter`          | Activate selected item                  |
 | `Space`          | Open service URL in browser             |
-| `a`              | Start all services                      |
-| `x`              | Stop all services                       |
+| `x`              | Stop all services (Services tab)        |
 | `q`              | Quit                                    |
 
-Services, commands, and tools also have their own shortcut keys defined in `devc.toml`.
+Services, commands, and tools also have their own shortcut keys defined in `devc.toml`. The keys `q`, `j`, `k`, and `space` are consumed by the UI on every tab, so don't bind them. `x` is only reserved on the Services tab — you can use it as a command or tool binding.
 
 ### Default Behaviors
 
@@ -55,6 +54,10 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 - **Local overrides** — if a sibling `devc.local.toml` exists, it's merged on top of `devc.toml` at startup (see below)
 - **Live config reload** — `devc.toml` and `devc.local.toml` are polled (~100ms via mtime). Edits reload automatically without restarting devc; running services are never killed. A `[reload]` (yellow) badge appears on a running service or command whose config changed — stop+start to apply. A `[removed]` (red) badge appears on a running entry that was removed from config — once stopped, it auto-disappears. Stopped commands are fully reset (logs cleared, status icon gone) when their config changes. Tools (links, copies) rebuild silently. Parse errors flash an error and keep the previous config active.
 
+### Upgrading
+
+See [MIGRATION.md](MIGRATION.md) for breaking changes between releases.
+
 ### Configuration
 
 ```toml
@@ -66,7 +69,6 @@ name = "API"
 key = "a"
 command = "docker compose up"
 working_dir = "api"
-service_type = "backend"
 url = "http://localhost:3000/"
 depends_on = []
 
@@ -76,7 +78,6 @@ key = "w"
 port = 5173
 command = "pnpm dev"
 working_dir = "web"
-service_type = "frontend"
 depends_on = ["API"]
 
 [[commands]]
@@ -104,7 +105,6 @@ text = "your-api-key"
 | `key`          | yes      | Single-character shortcut to toggle the service       |
 | `command`      | yes      | Shell command to start the service                   |
 | `working_dir`  | yes      | Working directory (relative to `project_root`)       |
-| `service_type` | yes      | Type label (e.g. `backend`, `frontend`)              |
 | `port`         | no       | Port to monitor (1–65535); shown in service list      |
 | `url`          | no       | URL to open with `Space` (defaults to `localhost:port`) |
 | `depends_on`   | no       | Array of service names to start first                |
@@ -145,14 +145,12 @@ name = "Scratch"
 key = "s"
 command = "pnpm dev:scratch"
 working_dir = "scratch"
-service_type = "backend"
 
 [[services]]
 name = "Web"                      # same name as in devc.toml — overrides
 key = "w"
 command = "pnpm dev --inspect"
 working_dir = "web"
-service_type = "frontend"
 port = 5173
 
 [[links]]
