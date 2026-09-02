@@ -26,6 +26,8 @@ pub struct CommandState {
     pub config: CommandConfig,
     pub process: Option<ProcessHandle>,
     pub status: CommandStatus,
+    /// Exit status of the last run — surfaced to agents via `devc status`.
+    pub exit_code: Option<i32>,
     pub logs: VecDeque<String>,
     pub config_dirty: bool,
     pub orphan: bool,
@@ -61,6 +63,7 @@ impl CommandsPane {
                     config: cfg,
                     process: None,
                     status: CommandStatus::Idle,
+                    exit_code: None,
                     logs: VecDeque::with_capacity(LOG_CAPACITY),
                     config_dirty: false,
                     orphan: false,
@@ -83,6 +86,7 @@ impl CommandsPane {
             return;
         }
         state.logs.clear();
+        state.exit_code = None;
         state.status = CommandStatus::Running;
         state.config_dirty = false;
         let working_dir = project_root.join(&state.config.working_dir);
@@ -108,6 +112,12 @@ impl CommandsPane {
         self.items.iter().position(|c| c.config.key_char().to_ascii_lowercase() == k)
     }
 
+    pub fn find_by_name(&self, name: &str) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|c| c.config.name.eq_ignore_ascii_case(name))
+    }
+
     pub fn poll_logs(&mut self) {
         while let Ok((source, line)) = self.log_rx.try_recv() {
             if let LogSource::Command(id) = source {
@@ -128,6 +138,7 @@ impl CommandsPane {
                     if !proc.is_running() {
                         let code = proc.exit_code();
                         cmd.process = None;
+                        cmd.exit_code = code;
                         if code == Some(0) {
                             cmd.status = CommandStatus::Done;
                             cmd.logs.push_back("── done ──".to_string());
@@ -164,6 +175,7 @@ impl CommandsPane {
                         config: new_cfg.clone(),
                         process: None,
                         status: CommandStatus::Idle,
+                        exit_code: None,
                         logs: VecDeque::with_capacity(LOG_CAPACITY),
                         config_dirty: false,
                         orphan: false,
@@ -191,6 +203,7 @@ impl CommandsPane {
                     config: cfg.clone(),
                     process: None,
                     status: CommandStatus::Idle,
+                    exit_code: None,
                     logs: VecDeque::with_capacity(LOG_CAPACITY),
                     config_dirty: false,
                     orphan: false,

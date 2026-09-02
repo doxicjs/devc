@@ -1,3 +1,7 @@
+//! Rendering. Everything here draws from a `Snapshot` — never from `App`
+//! directly — so the local TUI and an attached client share one code path and
+//! can't drift apart.
+
 use ansi_to_tui::IntoText;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -5,17 +9,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Tab};
-use crate::commands::CommandStatus;
-use crate::services::ServiceStatus;
-use crate::tools::ToolKind;
+use crate::protocol::{
+    CommandStatusKind, OwnerKind, Snapshot, StatusKind, TabKind, ToolRowKind,
+};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Build a scrollable log panel. `scroll_offset` is lines from bottom (0 = auto-scroll).
 fn render_log_panel(
     f: &mut Frame,
-    logs: &std::collections::VecDeque<String>,
+    logs: &[String],
     title: String,
     scroll_offset: usize,
     area: Rect,
@@ -59,7 +62,37 @@ fn render_log_panel(
     f.render_widget(paragraph, area);
 }
 
-pub fn draw(f: &mut Frame, app: &App) {
+fn selected_style() -> Style {
+    Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn panel(title: &'static str) -> Block<'static> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+}
+
+/// `[reload]` / `[removed]` badges, shared by the service and command lists.
+fn state_badges(dirty: bool, orphan: bool) -> Vec<Span<'static>> {
+    if orphan {
+        vec![Span::styled(
+            " [removed]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]
+    } else if dirty {
+        vec![Span::styled(
+            " [reload]",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn draw(f: &mut Frame, snap: &Snapshot) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -69,37 +102,41 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    draw_header(f, app, outer[0]);
+    draw_header(f, snap, outer[0]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(34), Constraint::Min(0)])
         .split(outer[1]);
 
-    match app.tab {
-        Tab::Services => {
-            draw_services(f, app, main[0]);
-            draw_logs(f, app, main[1]);
+    match snap.tab {
+        TabKind::Services => {
+            draw_services(f, snap, main[0]);
+            draw_logs(f, snap, main[1]);
         }
-        Tab::Commands => {
-            draw_commands(f, app, main[0]);
-            draw_command_logs(f, app, main[1]);
+        TabKind::Commands => {
+            draw_commands(f, snap, main[0]);
+            draw_command_logs(f, snap, main[1]);
         }
-        Tab::Tools => {
-            draw_tools(f, app, main[0]);
-            draw_tool_detail(f, app, main[1]);
+        TabKind::Tools => {
+            draw_tools(f, snap, main[0]);
+            draw_tool_detail(f, snap, main[1]);
         }
     }
 
-    draw_help(f, app, outer[2]);
+    draw_help(f, snap, outer[2]);
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let running = app.services.running_count();
-    let total = app.services.len();
+fn draw_header(f: &mut Frame, snap: &Snapshot, area: Rect) {
+    let running = snap.running_count();
+    let total = snap.services.len();
 
     let tabs = Tabs::new(vec!["Services", "Commands", "Tools"])
-        .select(app.tab as usize)
+        .select(match snap.tab {
+            TabKind::Services => 0,
+            TabKind::Commands => 1,
+            TabKind::Tools => 2,
+        })
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
@@ -111,25 +148,25 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     // Render tabs and status on the same line.
     // When a transient status flash is active, it takes the right slot;
     // otherwise the persistent N/M running count is shown.
-    let right_text = if let Some(msg) = app.status.current() {
+    let right_text = if let Some(msg) = snap.status_msg.as_deref() {
         format!(" {} ", msg)
     } else {
         format!(" {}/{} running ", running, total)
     };
-    let right_color = if app.status.current().is_some() || running > 0 {
+    let right_color = if snap.status_msg.is_some() || running > 0 {
         Color::Green
     } else {
         Color::DarkGray
     };
     let right_width = (right_text.chars().count() as u16).max(16);
 
-    let conflict_text = if app.conflicts.is_empty() {
+    let conflict_text = if snap.conflicts.is_empty() {
         None
     } else {
         Some(format!(
             " ⚠ {} conflict{} ",
-            app.conflicts.len(),
-            if app.conflicts.len() == 1 { "" } else { "s" },
+            snap.conflicts.len(),
+            if snap.conflicts.len() == 1 { "" } else { "s" },
         ))
     };
     let conflict_width = conflict_text
@@ -163,190 +200,145 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(status, header_layout[2]);
 }
 
-fn draw_services(f: &mut Frame, app: &App, area: Rect) {
-    let spinner_frame = SPINNER[app.tick as usize % SPINNER.len()];
+fn draw_services(f: &mut Frame, snap: &Snapshot, area: Rect) {
+    let spinner_frame = SPINNER[snap.tick as usize % SPINNER.len()];
 
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem> = snap
         .services
-        .items()
         .iter()
         .enumerate()
         .map(|(i, service)| {
+            let external = service.owner == OwnerKind::External;
             let (status_icon, status_color) = match service.status {
-                ServiceStatus::Running => ("●", Color::Green),
-                ServiceStatus::Starting => (spinner_frame, Color::Yellow),
-                ServiceStatus::Stopping => (spinner_frame, Color::Red),
-                ServiceStatus::Stopped if service.port_active => ("◆", Color::Cyan),
-                ServiceStatus::Stopped => ("○", Color::DarkGray),
+                StatusKind::Running => ("●", Color::Green),
+                StatusKind::Starting => (spinner_frame, Color::Yellow),
+                StatusKind::Stopping => (spinner_frame, Color::Red),
+                // Not ours, but the port answers — something else is serving.
+                StatusKind::Stopped if external => ("◆", Color::Cyan),
+                StatusKind::Stopped if service.port_active => ("◆", Color::Cyan),
+                StatusKind::Stopped => ("○", Color::DarkGray),
             };
 
             let port_str = service
-                .config
                 .port
                 .map(|p| format!(":{}", p))
                 .unwrap_or_default();
 
             let mut spans = vec![
                 Span::styled(
-                    format!(" [{}] ", service.config.key_char().to_ascii_uppercase()),
+                    format!(" [{}] ", service.key.to_ascii_uppercase()),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
                 Span::styled(
-                    format!("{}{}", service.config.name, port_str),
+                    format!("{}{}", service.name, port_str),
                     Style::default().fg(Color::White),
                 ),
             ];
-            if service.orphan {
+            // Name the foreign owner: without this, "◆" is indistinguishable
+            // from a service devc is about to start, and the whole point is
+            // that you can tell nobody should start a second one.
+            if external {
                 spans.push(Span::styled(
-                    " [removed]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
-            } else if service.config_dirty {
-                spans.push(Span::styled(
-                    " [reload]",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    match service.pid {
+                        Some(pid) => format!(" [external pid {}]", pid),
+                        None => " [external]".to_string(),
+                    },
+                    Style::default().fg(Color::Cyan),
                 ));
             }
+            spans.extend(state_badges(service.dirty, service.orphan));
             let line = Line::from(spans);
 
             let item = ListItem::new(line);
-            if i == app.services.selected_idx() {
-                item.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
+            if i == snap.service_selected {
+                item.style(selected_style())
             } else {
                 item
             }
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Services ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-
-    f.render_widget(list, area);
+    f.render_widget(List::new(items).block(panel(" Services ")), area);
 }
 
-fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
-    let Some(service) = app.services.items().get(app.services.selected_idx()) else {
-        let empty = Paragraph::new("No services configured").block(
-            Block::default()
-                .title(" Logs ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
+fn draw_logs(f: &mut Frame, snap: &Snapshot, area: Rect) {
+    let Some(service) = snap.services.get(snap.service_selected) else {
+        let empty = Paragraph::new("No services configured").block(panel(" Logs "));
         f.render_widget(empty, area);
         return;
     };
     render_log_panel(
         f,
-        &service.logs,
-        format!(" {} ", service.config.name),
-        app.services.log_scroll_offset,
+        &snap.service_logs,
+        format!(" {} ", service.name),
+        snap.service_log_scroll,
         area,
     );
 }
 
-fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
-    let spinner_frame = SPINNER[app.tick as usize % SPINNER.len()];
+fn draw_commands(f: &mut Frame, snap: &Snapshot, area: Rect) {
+    let spinner_frame = SPINNER[snap.tick as usize % SPINNER.len()];
 
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem> = snap
         .commands
-        .items()
         .iter()
         .enumerate()
         .map(|(i, cmd)| {
             let (status_icon, status_color) = match cmd.status {
-                CommandStatus::Idle => ("○", Color::DarkGray),
-                CommandStatus::Running => (spinner_frame, Color::Yellow),
-                CommandStatus::Done => ("✓", Color::Green),
-                CommandStatus::Failed => ("✗", Color::Red),
+                CommandStatusKind::Idle => ("○", Color::DarkGray),
+                CommandStatusKind::Running => (spinner_frame, Color::Yellow),
+                CommandStatusKind::Done => ("✓", Color::Green),
+                CommandStatusKind::Failed => ("✗", Color::Red),
             };
 
             let mut spans = vec![
                 Span::styled(
-                    format!(" [{}] ", cmd.config.key_char().to_ascii_uppercase()),
+                    format!(" [{}] ", cmd.key.to_ascii_uppercase()),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
-                Span::styled(cmd.config.name.clone(), Style::default().fg(Color::White)),
+                Span::styled(cmd.name.clone(), Style::default().fg(Color::White)),
             ];
-            if cmd.orphan {
-                spans.push(Span::styled(
-                    " [removed]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
-            } else if cmd.config_dirty {
-                spans.push(Span::styled(
-                    " [reload]",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ));
-            }
+            spans.extend(state_badges(cmd.dirty, cmd.orphan));
             let line = Line::from(spans);
 
             let item = ListItem::new(line);
-            if i == app.commands.selected_idx() {
-                item.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
+            if i == snap.command_selected {
+                item.style(selected_style())
             } else {
                 item
             }
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Commands ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-
-    f.render_widget(list, area);
+    f.render_widget(List::new(items).block(panel(" Commands ")), area);
 }
 
-fn draw_command_logs(f: &mut Frame, app: &App, area: Rect) {
-    let Some(cmd) = app.commands.items().get(app.commands.selected_idx()) else {
-        let empty = Paragraph::new("No commands configured").block(
-            Block::default()
-                .title(" Output ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
+fn draw_command_logs(f: &mut Frame, snap: &Snapshot, area: Rect) {
+    let Some(cmd) = snap.commands.get(snap.command_selected) else {
+        let empty = Paragraph::new("No commands configured").block(panel(" Output "));
         f.render_widget(empty, area);
         return;
     };
     render_log_panel(
         f,
-        &cmd.logs,
-        format!(" {} ", cmd.config.name),
-        app.commands.log_scroll_offset,
+        &snap.command_logs,
+        format!(" {} ", cmd.name),
+        snap.command_log_scroll,
         area,
     );
 }
 
-fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
+fn draw_tools(f: &mut Frame, snap: &Snapshot, area: Rect) {
+    let items: Vec<ListItem> = snap
         .tools
-        .items()
         .iter()
         .enumerate()
         .map(|(i, tool)| {
-            let kind_icon = match &tool.kind {
-                ToolKind::Link(_) => "->",
-                ToolKind::Copy(_) => "cp",
-            };
-            let kind_color = match &tool.kind {
-                ToolKind::Link(_) => Color::Blue,
-                ToolKind::Copy(_) => Color::Magenta,
+            let (kind_icon, kind_color) = match &tool.kind {
+                ToolRowKind::Link { .. } => ("->", Color::Blue),
+                ToolRowKind::Copy { .. } => ("cp", Color::Magenta),
             };
 
             let line = Line::from(vec![
@@ -359,43 +351,27 @@ fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
             ]);
 
             let item = ListItem::new(line);
-            if i == app.tools.selected_idx() {
-                item.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
+            if i == snap.tool_selected {
+                item.style(selected_style())
             } else {
                 item
             }
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Tools ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-
-    f.render_widget(list, area);
+    f.render_widget(List::new(items).block(panel(" Tools ")), area);
 }
 
-fn draw_tool_detail(f: &mut Frame, app: &App, area: Rect) {
-    let Some(tool) = app.tools.items().get(app.tools.selected_idx()) else {
-        let empty = Paragraph::new("No tools configured").block(
-            Block::default()
-                .title(" Detail ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
+fn draw_tool_detail(f: &mut Frame, snap: &Snapshot, area: Rect) {
+    let Some(tool) = snap.tools.get(snap.tool_selected) else {
+        let empty = Paragraph::new("No tools configured").block(panel(" Detail "));
         f.render_widget(empty, area);
         return;
     };
 
     let (label, value) = match &tool.kind {
-        ToolKind::Link(url) => ("URL", url.as_str()),
-        ToolKind::Copy(text) => ("Text", text.as_str()),
+        ToolRowKind::Link { url } => ("URL", url.as_str()),
+        ToolRowKind::Copy { text } => ("Text", text.as_str()),
     };
 
     let lines = vec![
@@ -413,18 +389,13 @@ fn draw_tool_detail(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Detail ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
+        .block(panel(" Detail "))
         .wrap(Wrap { trim: false });
 
     f.render_widget(paragraph, area);
 }
 
-fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+fn draw_help(f: &mut Frame, snap: &Snapshot, area: Rect) {
     let mut spans = vec![
         Span::styled(" q", Style::default().fg(Color::Yellow)),
         Span::raw(" quit  "),
@@ -436,20 +407,18 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" activate  "),
     ];
 
-    match app.tab {
-        Tab::Services => {
+    match snap.tab {
+        TabKind::Services => {
             spans.extend([
                 Span::styled("Space", Style::default().fg(Color::Yellow)),
                 Span::raw(" open  "),
-                Span::styled("a", Style::default().fg(Color::Yellow)),
-                Span::raw(" start all  "),
                 Span::styled("x", Style::default().fg(Color::Yellow)),
                 Span::raw(" stop all  "),
                 Span::styled("PgUp/Dn", Style::default().fg(Color::Yellow)),
                 Span::raw(" scroll"),
             ]);
         }
-        Tab::Commands => {
+        TabKind::Commands => {
             spans.extend([
                 Span::styled("[key]", Style::default().fg(Color::Yellow)),
                 Span::raw(" run command  "),
@@ -457,7 +426,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" scroll"),
             ]);
         }
-        Tab::Tools => {
+        TabKind::Tools => {
             spans.extend([
                 Span::styled("[key]", Style::default().fg(Color::Yellow)),
                 Span::raw(" run tool"),
@@ -485,7 +454,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, Tab};
     use crate::config::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -531,7 +500,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         // Panics on current code: draw_logs does app.services[app.selected]
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     #[test]
@@ -540,7 +509,7 @@ mod tests {
         let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     // ===== Normal rendering =====
@@ -551,7 +520,7 @@ mod tests {
         let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     #[test]
@@ -559,9 +528,10 @@ mod tests {
         let config = make_config(vec![svc("web", "w")], vec![]);
         let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Commands;
+        app.refresh_snapshot();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     #[test]
@@ -569,9 +539,10 @@ mod tests {
         let config = make_config(vec![], vec![cmd("build", "b"), cmd("test", "t")]);
         let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Commands;
+        app.refresh_snapshot();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     #[test]
@@ -579,9 +550,10 @@ mod tests {
         let config = make_config(vec![], vec![]);
         let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Tools;
+        app.refresh_snapshot();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     #[test]
@@ -603,9 +575,10 @@ mod tests {
         };
         let mut app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         app.tab = Tab::Tools;
+        app.refresh_snapshot();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     // ===== Edge cases =====
@@ -616,7 +589,7 @@ mod tests {
         let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(10, 3);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     #[test]
@@ -625,7 +598,7 @@ mod tests {
         let app = App::new(config, PathBuf::from("/tmp"), PathBuf::from("/tmp/devc.toml"), None);
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
     }
 
     #[test]
@@ -637,7 +610,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
 
         let buf = terminal.backend().buffer();
         let header: String = (0..buf.area.width)
@@ -655,7 +628,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &app.snapshot)).unwrap();
 
         let buf = terminal.backend().buffer();
         let header: String = (0..buf.area.width)

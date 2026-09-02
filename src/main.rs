@@ -1,12 +1,15 @@
 mod app;
+mod client;
 mod commands;
 mod config;
 mod config_watcher;
+mod control;
 mod id;
 mod keys;
 mod platform;
 mod port_monitor;
 mod process;
+mod protocol;
 mod services;
 mod status;
 mod tools;
@@ -29,16 +32,17 @@ use ratatui::Terminal;
 
 use app::App;
 use config::Config;
+use protocol::RemoteKey;
 
 const INSTALL_URL: &str = "https://raw.githubusercontent.com/doxicjs/devc/main/install.sh";
 
 /// RAII guard: enables raw mode + alt screen + mouse capture on `enter`, and
 /// restores the terminal on drop — including on panic — so users are never
 /// stranded in an unusable terminal state.
-struct RawTerminal;
+pub struct RawTerminal;
 
 impl RawTerminal {
-    fn enter() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn enter() -> Result<Self, Box<dyn std::error::Error>> {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
@@ -54,6 +58,19 @@ impl Drop for RawTerminal {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+
+    // Control subcommands run against an already-running devc and exit. Checked
+    // before anything else so `devc status` can never be mistaken for a request
+    // to open a config file named "status".
+    if let Some(verb) = args.get(1) {
+        if client::is_verb(verb) {
+            std::process::exit(client::run(&args[1..]));
+        }
+        if verb == "--help" || verb == "-h" {
+            print_help();
+            return Ok(());
+        }
+    }
 
     if args.iter().any(|a| a == "--update" || a == "-u") {
         println!("Updating devc...");
@@ -102,6 +119,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
 
+    // Claim the control socket before doing anything expensive. If another
+    // devc already owns this project, become a second view of it rather than a
+    // second supervisor — two supervisors would each spawn their own copy of
+    // every service, which is exactly the problem this is here to prevent.
+    let bind = control::ControlServer::bind(&config_path)?;
+    let server = match bind {
+        control::Bind::Bound(server) => server,
+        control::Bind::AlreadyRunning { pid, .. } => {
+            match pid {
+                Some(pid) => eprintln!("devc is already running for this project (pid {}) — attaching", pid),
+                None => eprintln!("devc is already running for this project — attaching"),
+            }
+            return client::attach(&config_path);
+        }
+    };
+
     let local_path = local_config_path(&config_path);
     let config = Config::load(&config_path, local_path.as_deref())?;
 
@@ -111,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut app = App::new(config, config_dir, config_path, local_path);
+    app.attach_control(server);
 
     // Handle SIGINT/SIGTERM so cleanup() runs before exit.
     // Uses libc directly (no extra deps) — the handler only touches an AtomicBool,
@@ -128,6 +162,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         action.sa_flags = 0;
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+        // Closing the terminal is a normal way for a TUI to end. Without this,
+        // devc dies on the spot — leaving its services orphaned and its control
+        // socket behind for the next run to clean up.
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
     }
 
     let result = {
@@ -151,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-fn local_config_path(main_path: &std::path::Path) -> Option<PathBuf> {
+pub fn local_config_path(main_path: &std::path::Path) -> Option<PathBuf> {
     let parent = main_path.parent()?;
     let file_name = main_path.file_name()?.to_str()?;
     let local_name = match main_path.extension().and_then(|e| e.to_str()) {
@@ -176,46 +214,70 @@ fn run(
 
         app.poll();
 
-        terminal.draw(|f| ui::draw(f, app))?;
+        terminal.draw(|f| ui::draw(f, &app.snapshot))?;
 
         // 100ms poll = ~10fps render + tick rate for spinners and port checks
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Tab => app.next_tab(),
-                        KeyCode::BackTab => app.prev_tab(),
-                        KeyCode::Up | KeyCode::Char('k') => app.select_up(),
-                        KeyCode::Down | KeyCode::Char('j') => app.select_down(),
-                        KeyCode::Enter => app.activate_selected(),
-                        KeyCode::Char(' ') => {
-                            if app.tab == app::Tab::Services {
-                                let idx = app.services.selected_idx();
-                                match app.services.open_url(idx) {
-                                    Ok(msg) | Err(msg) => app.status.set(msg),
-                                }
-                            }
-                        }
-                        KeyCode::PageUp => app.scroll_up(10),
-                        KeyCode::PageDown => app.scroll_down(10),
-                        KeyCode::Home => app.scroll_up(usize::MAX / 2),
-                        KeyCode::End => app.scroll_to_bottom(),
-                        KeyCode::Char(c) => app.handle_char(c),
-                        _ => {}
-                    }
-                }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_up(1),
-                    MouseEventKind::ScrollDown => app.scroll_down(1),
-                    _ => {}
+            // Local keys go through the same handler as keys forwarded by an
+            // attached client, so the two can't drift apart.
+            let key = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Tab => RemoteKey::Tab,
+                    KeyCode::BackTab => RemoteKey::BackTab,
+                    KeyCode::Up => RemoteKey::Up,
+                    KeyCode::Down => RemoteKey::Down,
+                    KeyCode::Enter => RemoteKey::Enter,
+                    KeyCode::Char(' ') => RemoteKey::Space,
+                    KeyCode::PageUp => RemoteKey::PageUp,
+                    KeyCode::PageDown => RemoteKey::PageDown,
+                    KeyCode::Home => RemoteKey::Home,
+                    KeyCode::End => RemoteKey::End,
+                    KeyCode::Char(c) => RemoteKey::Char(c),
+                    _ => continue,
                 },
-                _ => {}
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => RemoteKey::ScrollUp,
+                    MouseEventKind::ScrollDown => RemoteKey::ScrollDown,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if !app.handle_key(key) {
+                break;
             }
         }
     }
     Ok(())
+}
+
+fn print_help() {
+    println!(
+        "\
+devc {version} — dev service control
+
+  devc [CONFIG]            run the TUI (default config: ./devc.toml)
+                           if a devc already owns this project, attach to it
+
+Control a running devc (for scripts and agents):
+  devc ls [--json]                     list configured services and commands
+  devc status [NAME] [--json]          what's up, who owns it, on which pid
+  devc start NAME [--wait]             start if not already up (idempotent)
+  devc stop NAME [--no-wait]           stop, if devc started it
+  devc restart NAME [--wait]           stop then start
+  devc run NAME                        run a [[commands]] entry
+  devc logs NAME [-n 100]              tail buffered output
+
+Options:
+  -c, --config PATH        config file to target (default ./devc.toml)
+  -t, --timeout SECS       cap on --wait (default 30s; 10s for stop)
+  -w, --wait               block until the service is actually serving
+      --json               machine-readable output
+  -v, --version            print version
+  -u, --update             update devc in place
+
+Exit codes: 0 ok (including 'already running')  1 usage/failure
+            2 no such name  3 no devc running  4 refused
+",
+        version = env!("CARGO_PKG_VERSION")
+    );
 }

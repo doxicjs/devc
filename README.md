@@ -13,11 +13,14 @@ curl -fsSL https://raw.githubusercontent.com/doxicjs/devc/main/install.sh | bash
 Place a `devc.toml` in your project root and run:
 
 ```bash
-devc                  # uses ./devc.toml
+devc                  # uses ./devc.toml (attaches if one is already running)
 devc path/to/config   # custom config path
+devc -h               # full command reference
 devc -v               # show version
 devc -u               # update to latest
 ```
+
+devc can also be driven from outside the TUI — `devc status`, `devc start Web`, `devc stop Web` — see [Driving devc from scripts and agents](#driving-devc-from-scripts-and-agents).
 
 ### Tabs
 
@@ -34,7 +37,7 @@ devc -u               # update to latest
 | `Enter`          | Activate selected item                  |
 | `Space`          | Open service URL in browser             |
 | `x`              | Stop all services (Services tab)        |
-| `q`              | Quit                                    |
+| `q`              | Quit (detaches, if this is an attached view) |
 
 Services, commands, and tools also have their own shortcut keys defined in `devc.toml`. The keys `q`, `j`, `k`, and `space` are consumed by the UI on every tab, so don't bind them. `x` is only reserved on the Services tab — you can use it as a command or tool binding.
 
@@ -43,6 +46,8 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 - **Config file** — reads `./devc.toml` from the current directory
 - **Project root** — defaults to `./` (the directory containing `devc.toml`)
 - **Port monitoring** — when `port` is set, devc checks it every ~2s on IPv4 and IPv6 loopback and shows a status icon; include the port flag in your command if the service needs it
+- **Single instance** — one devc supervises a given `devc.toml`; a second `devc` in the same project attaches to it as another view rather than starting a rival supervisor
+- **Duplicate protection** — starting a service that's already up is a no-op. If its `port` is held by a process devc didn't start, the service shows as `external` with that pid and devc refuses to spawn a second copy or to kill the foreign one
 - **Service URL** — if `url` is not set but `port` is, `Space` opens `http://localhost:<port>/`
 - **Dependencies** — services listed in `depends_on` are started automatically before the dependent service
 - **Stop signal** — services receive `SIGTERM` first, then `SIGKILL` after 3s if still running
@@ -53,6 +58,80 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 - **Sections** — all sections are optional including `services`; unknown fields are rejected with a clear error
 - **Local overrides** — if a sibling `devc.local.toml` exists, it's merged on top of `devc.toml` at startup (see below)
 - **Live config reload** — `devc.toml` and `devc.local.toml` are polled (~100ms via mtime). Edits reload automatically without restarting devc; running services are never killed. A `[reload]` (yellow) badge appears on a running service or command whose config changed — stop+start to apply. A `[removed]` (red) badge appears on a running entry that was removed from config — once stopped, it auto-disappears. Stopped commands are fully reset (logs cleared, status icon gone) when their config changes. Tools (links, copies) rebuild silently. Parse errors flash an error and keep the previous config active.
+
+### Driving devc from scripts and agents
+
+A running devc listens on a per-project Unix socket. The same binary doubles as the client, so anything that can run a command — a script, a Makefile, a coding agent — can ask devc what's up and turn things on and off.
+
+```bash
+devc ls                      # what can I start? (works with no devc running)
+devc status                  # what's up, who owns it, on which pid
+devc status Web --json       # machine-readable, one service
+devc start Web               # start if not already up
+devc start Web --wait        # ...and block until the port actually answers
+devc stop Web                # stop, if devc started it
+devc restart Web --wait
+devc run Migrate             # run a [[commands]] entry
+devc logs Web -n 50          # tail buffered output
+```
+
+All of these target `./devc.toml` unless you pass `--config PATH`.
+
+#### Start is idempotent
+
+`devc start Web` on a service that's already running is a **no-op that exits 0** and tells you the pid. This is the point: a caller that has lost track of what it started can't create a second copy of your dev server by asking again.
+
+```console
+$ devc start Web
+started (pid 48213)
+$ devc start Web
+already running (pid 48213)
+```
+
+The check is a live TCP probe taken immediately before spawning, not a cached flag, so there's no window where two rapid starts both get through.
+
+#### Servers devc didn't start
+
+If a service's `port` is answering but devc has no process for it — someone ran `pnpm dev` in a shell and forgot — devc reports it as `external` and names the pid:
+
+```console
+$ devc status
+SERVICE              STATUS     PORT     PID
+Web                  external   8899     33211
+
+$ devc start Web
+port 8899 held by external pid 33211      # exit 0 — it's up, nothing to do
+
+$ devc stop Web
+devc: port 8899 held by external pid 33211 — devc didn't start it, so it won't stop it
+                                          # exit 4 — devc won't kill what it didn't spawn
+```
+
+This detection needs a `port` on the service. Without one there's nothing to probe, so set `port` on anything you want protected from duplicate starts.
+
+#### Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Success — **including** "already running". The requested state holds. |
+| `1`  | Usage error, or the action failed |
+| `2`  | No service or command by that name (the error lists the valid ones) |
+| `3`  | No devc running for this config |
+| `4`  | Refused — e.g. stopping a service devc didn't start |
+
+Because "already running" is a success, the common agent pattern is just:
+
+```bash
+devc start Web --wait || exit 1    # ensure it's up; fine to call repeatedly
+```
+
+#### Only one devc per project
+
+The socket doubles as a lock. Running `devc` in a project that already has one attaches to it as a second view rather than starting a second supervisor — two supervisors would each spawn their own copy of every service.
+
+An attached view shares the primary's cursor and scroll position, like `tmux attach`. Pressing `q` detaches; it does not quit the primary or stop anything. A socket left behind by a devc that crashed is detected (the recorded pid is gone, or it fails to answer a handshake) and reclaimed automatically.
+
+The socket lives in a `0700` directory under `$XDG_RUNTIME_DIR`, `$TMPDIR`, or `/tmp`, so it's reachable only by you. Note that anyone who can write to it can run any command in your `devc.toml` — the same trust boundary as your shell.
 
 ### Upgrading
 
