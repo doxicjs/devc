@@ -1,5 +1,42 @@
 # Migration Guide
 
+## 0.2.0 → 0.3.0
+
+0.3.0 adds a control socket so scripts and agents can query and drive a running devc, and makes devc the single authority on whether a service is up. No config changes are required.
+
+### A second `devc` now attaches instead of starting a second supervisor
+
+Running `devc` in a project that already has one no longer gives you two independent devcs each spawning their own copy of every service. The second invocation attaches to the first as an extra view — like `tmux attach`.
+
+Consequences:
+
+- Selection and scroll are **shared**. Moving the cursor in the attached view moves it in the primary.
+- `q` in an attached view detaches. It does not quit the primary or stop any services.
+- If you relied on running two devcs against the same `devc.toml`, use separate config files (their sockets are keyed by the canonical config path).
+
+### Services held by a foreign process are reported, not duplicated
+
+If a service's `port` is already answering and devc has no process for it, the service now shows as `external` with the owning PID (`◆ Web:5173 [external pid 48213]`) instead of a bare `◆`.
+
+- Starting it is a no-op that says who holds the port. It will not spawn a second copy.
+- Stopping it is **refused** — devc didn't start it, so it won't kill it. Stop it yourself.
+
+This only works for services with a `port` set. A service with no `port` has nothing observable to probe, so set `port` where you want this protection.
+
+### `x` (stop-all) and toggling are unchanged
+
+Existing keybindings behave the same. One internal change: the Services help line no longer advertises `a start all`, which stopped existing in 0.2.0.
+
+### New: control subcommands
+
+`status`, `start`, `stop`, `restart`, `run`, `logs`, and `ls` are now reserved as the first argument. If you have a config file literally named one of these, pass it with `--config`:
+
+```bash
+devc --config status    # instead of: devc status
+```
+
+See the README's "Driving devc from scripts and agents" section.
+
 ## 0.1.x → 0.2.0
 
 0.2.0 tightens the config schema and the keybinding model. Most users won't touch their config — the changes show up as clearer error messages and a new `⚠ conflicts` badge when something's off.

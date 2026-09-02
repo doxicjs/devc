@@ -1,13 +1,56 @@
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use crate::commands::CommandsPane;
+use crate::commands::{CommandStatus, CommandsPane};
+use crate::control::{ControlServer, Job};
 use crate::config::Config;
 use crate::config_watcher::{ConfigWatcher, WatchEvent};
 use crate::id::{CommandId, ServiceId};
 use crate::port_monitor::PortMonitor;
-use crate::services::ServicesPane;
+use crate::protocol as proto;
+use crate::services::{Outcome, Owner, ServiceStatus, ServicesPane};
 use crate::status::StatusBar;
-use crate::tools::ToolsPane;
+use crate::tools::{ToolKind, ToolsPane};
+
+/// A blank snapshot, used as the seed before the first `refresh_snapshot`.
+pub fn empty_snapshot() -> proto::Snapshot {
+    proto::Snapshot {
+        version: 0,
+        tick: 0,
+        tab: proto::TabKind::Services,
+        status_msg: None,
+        conflicts: Vec::new(),
+        services: Vec::new(),
+        service_selected: 0,
+        service_logs: Vec::new(),
+        service_log_scroll: 0,
+        commands: Vec::new(),
+        command_selected: 0,
+        command_logs: Vec::new(),
+        command_log_scroll: 0,
+        tools: Vec::new(),
+        tool_selected: 0,
+    }
+}
+
+/// A `--wait` request parked until the service reaches the state it asked for.
+/// Keyed by name, not index, because a config reload can renumber the table
+/// out from under a request that's still in flight.
+struct Pending {
+    reply: mpsc::Sender<proto::Response>,
+    name: String,
+    goal: Goal,
+    deadline: Instant,
+}
+
+enum Goal {
+    /// Running, and — if a port is configured — actually answering on it.
+    Up,
+    Down,
+    /// Stopped as the first half of a restart; start it once it lands.
+    DownThenUp { wait: bool },
+}
 
 /// Log messages are tagged with a source: Service(id) or Command(id)
 pub enum LogSource {
@@ -80,6 +123,14 @@ pub struct App {
     pub project_root: PathBuf,
     pub config_dir: PathBuf,
     pub conflicts: Vec<String>,
+    /// Rebuilt once per tick at the end of `poll()`. Both the local TUI and any
+    /// attached client render from this, so there is exactly one description of
+    /// what devc is showing.
+    pub snapshot: proto::Snapshot,
+    /// None when devc couldn't claim the socket — the TUI still works, it just
+    /// can't be driven from outside.
+    pub control: Option<Box<ControlServer>>,
+    pending: Vec<Pending>,
 }
 
 impl App {
@@ -97,7 +148,7 @@ impl App {
 
         let conflicts = crate::keys::detect_conflicts(services.items(), commands.items(), tools.items());
 
-        Self {
+        let mut app = Self {
             services,
             commands,
             tools,
@@ -109,7 +160,16 @@ impl App {
             project_root,
             config_dir,
             conflicts,
-        }
+            snapshot: empty_snapshot(),
+            control: None,
+            pending: Vec::new(),
+        };
+        app.refresh_snapshot();
+        app
+    }
+
+    pub fn attach_control(&mut self, server: Box<ControlServer>) {
+        self.control = Some(server);
     }
 
     // --- Tab ---
@@ -191,6 +251,37 @@ impl App {
         }
     }
 
+    /// The single input path: the local event loop translates crossterm events
+    /// into `RemoteKey`s and lands here, and so does an attached client's
+    /// forwarded keystroke. Returns false when the key means "quit".
+    pub fn handle_key(&mut self, key: proto::RemoteKey) -> bool {
+        use proto::RemoteKey as K;
+        match key {
+            K::Char('q') => return false,
+            K::Char('k') | K::Up => self.select_up(),
+            K::Char('j') | K::Down => self.select_down(),
+            K::Tab => self.next_tab(),
+            K::BackTab => self.prev_tab(),
+            K::Enter => self.activate_selected(),
+            K::Space => {
+                if self.tab == Tab::Services {
+                    let idx = self.services.selected_idx();
+                    match self.services.open_url(idx) {
+                        Ok(msg) | Err(msg) => self.status.set(msg),
+                    }
+                }
+            }
+            K::PageUp => self.scroll_up(10),
+            K::PageDown => self.scroll_down(10),
+            K::Home => self.scroll_up(usize::MAX / 2),
+            K::End => self.scroll_to_bottom(),
+            K::ScrollUp => self.scroll_up(1),
+            K::ScrollDown => self.scroll_down(1),
+            K::Char(c) => self.handle_char(c),
+        }
+        true
+    }
+
     pub fn handle_char(&mut self, c: char) {
         match self.tab {
             Tab::Services => match c {
@@ -221,6 +312,9 @@ impl App {
     pub fn cleanup(&mut self) {
         self.services.cleanup();
         self.commands.cleanup();
+        // Dropping the server unlinks the socket, so the next run does not have
+        // to go through stale-socket recovery.
+        self.control = None;
     }
 
     pub fn poll(&mut self) {
@@ -238,6 +332,401 @@ impl App {
             self.port_monitor.kick(self.services.port_targets());
         }
         self.status.clear_if_expired();
+
+        // Apply control requests *before* rebuilding the snapshot, so a client
+        // that asks for status in the same tick sees the effect of the actions
+        // applied alongside it rather than last tick's world.
+        let status_replies = self.service_control();
+        self.refresh_snapshot();
+        for reply in status_replies {
+            let _ = reply.send(proto::Response {
+                outcome: proto::OutcomeKind::NoOp,
+                reason: String::new(),
+                snapshot: Some(self.snapshot.clone()),
+                logs: None,
+            });
+        }
+        if let Some(control) = self.control.as_mut() {
+            control.broadcast(&self.snapshot);
+        }
+    }
+
+    // --- Control socket ---
+
+    /// Apply everything that arrived on the socket. Returns the reply channels
+    /// of clients waiting on a status snapshot, which can only be answered once
+    /// the snapshot has been rebuilt.
+    fn service_control(&mut self) -> Vec<mpsc::Sender<proto::Response>> {
+        let Some(jobs) = self.control.as_mut().map(|c| c.drain_jobs()) else {
+            return Vec::new();
+        };
+
+        let mut status_replies = Vec::new();
+        for job in jobs {
+            if let Some(reply) = self.handle_job(job) {
+                status_replies.push(reply);
+            }
+        }
+        self.resolve_pending();
+        status_replies
+    }
+
+    /// Returns the reply channel when the answer is "a fresh snapshot".
+    fn handle_job(&mut self, job: Job) -> Option<mpsc::Sender<proto::Response>> {
+        use proto::{Op, OutcomeKind, Response};
+
+        match job.req.op {
+            Op::Status => return Some(job.reply),
+
+            Op::Subscribe => {
+                if let Some(control) = self.control.as_mut() {
+                    control.add_subscriber(job.reply.clone());
+                }
+                // Send the current view immediately so an attaching client has
+                // something to draw before the next change.
+                let _ = job.reply.send(Response {
+                    outcome: OutcomeKind::Changed,
+                    reason: String::new(),
+                    snapshot: Some(self.snapshot.clone()),
+                    logs: None,
+                });
+            }
+
+            Op::Key { key } => {
+                self.handle_key(key);
+                let _ = job.reply.send(Response::new(OutcomeKind::Changed, ""));
+            }
+
+            Op::Start { name, wait, timeout_ms } => {
+                let Some(idx) = self.services.find_by_name(&name) else {
+                    let _ = job.reply.send(unknown_service(&self.services, &name));
+                    return None;
+                };
+                let result = self.services.start(idx, &self.project_root);
+                self.status.set(format!("{}: {}", name, result.reason));
+
+                // Nothing to wait for if it's already up or the start failed.
+                if wait && result.outcome == Outcome::Changed {
+                    self.park(job.reply, name, Goal::Up, timeout_ms);
+                } else {
+                    let _ = job.reply.send(from_action(&result));
+                }
+            }
+
+            Op::Stop { name, wait, timeout_ms } => {
+                let Some(idx) = self.services.find_by_name(&name) else {
+                    let _ = job.reply.send(unknown_service(&self.services, &name));
+                    return None;
+                };
+                let result = self.services.stop(idx);
+                self.status.set(format!("{}: {}", name, result.reason));
+
+                if wait && result.outcome == Outcome::Changed {
+                    self.park(job.reply, name, Goal::Down, timeout_ms);
+                } else {
+                    let _ = job.reply.send(from_action(&result));
+                }
+            }
+
+            Op::Restart { name, wait, timeout_ms } => {
+                let Some(idx) = self.services.find_by_name(&name) else {
+                    let _ = job.reply.send(unknown_service(&self.services, &name));
+                    return None;
+                };
+                let stop_result = self.services.stop(idx);
+                match stop_result.outcome {
+                    // Already down (or never up): go straight to starting it.
+                    Outcome::NoOp => {
+                        let start = self.services.start(idx, &self.project_root);
+                        self.status.set(format!("{}: {}", name, start.reason));
+                        if wait && start.outcome == Outcome::Changed {
+                            self.park(job.reply, name, Goal::Up, timeout_ms);
+                        } else {
+                            let _ = job.reply.send(from_action(&start));
+                        }
+                    }
+                    Outcome::Changed => {
+                        self.status.set(format!("{}: restarting", name));
+                        self.park(job.reply, name, Goal::DownThenUp { wait }, timeout_ms);
+                    }
+                    _ => {
+                        let _ = job.reply.send(from_action(&stop_result));
+                    }
+                }
+            }
+
+            Op::Run { name } => {
+                let Some(idx) = self.commands.find_by_name(&name) else {
+                    let names: Vec<&str> = self
+                        .commands
+                        .items()
+                        .iter()
+                        .map(|c| c.config.name.as_str())
+                        .collect();
+                    let _ = job.reply.send(Response::not_found(format!(
+                        "no command named '{}' (have: {})",
+                        name,
+                        if names.is_empty() { "none".to_string() } else { names.join(", ") }
+                    )));
+                    return None;
+                };
+                self.commands.run(idx, &self.project_root);
+                self.status.set(format!("{}: running", name));
+                let _ = job.reply.send(Response::new(OutcomeKind::Changed, "running"));
+            }
+
+            Op::Logs { name, lines } => {
+                let logs = self
+                    .services
+                    .find_by_name(&name)
+                    .map(|i| tail(&self.services[i].logs, lines))
+                    .or_else(|| {
+                        self.commands
+                            .find_by_name(&name)
+                            .map(|i| tail(&self.commands[i].logs, lines))
+                    });
+                let _ = job.reply.send(match logs {
+                    Some(logs) => Response {
+                        outcome: OutcomeKind::NoOp,
+                        reason: String::new(),
+                        snapshot: None,
+                        logs: Some(logs),
+                    },
+                    None => Response::not_found(format!("no service or command named '{}'", name)),
+                });
+            }
+        }
+        None
+    }
+
+    fn park(
+        &mut self,
+        reply: mpsc::Sender<proto::Response>,
+        name: String,
+        goal: Goal,
+        timeout_ms: u64,
+    ) {
+        self.pending.push(Pending {
+            reply,
+            name,
+            goal,
+            deadline: Instant::now() + Duration::from_millis(timeout_ms),
+        });
+    }
+
+    /// Answer any `--wait` request whose service has reached its goal, timed
+    /// out, or disappeared from the config.
+    fn resolve_pending(&mut self) {
+        use proto::{OutcomeKind, Response};
+
+        if self.pending.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut still_pending = Vec::with_capacity(self.pending.len());
+
+        for mut p in std::mem::take(&mut self.pending) {
+            let Some(idx) = self.services.find_by_name(&p.name) else {
+                let _ = p.reply.send(Response::not_found(format!(
+                    "'{}' disappeared from config while waiting",
+                    p.name
+                )));
+                continue;
+            };
+            let service = &self.services[idx];
+
+            match p.goal {
+                Goal::Up => {
+                    let listening = match service.config.port {
+                        // A port that answers is the only proof that "running"
+                        // means "ready" — a live PID says nothing about it.
+                        Some(_) => service.port_active,
+                        None => service.status == ServiceStatus::Running,
+                    };
+                    if service.status == ServiceStatus::Running && listening {
+                        let pid = service.pid();
+                        let _ = p.reply.send(Response::new(
+                            OutcomeKind::Changed,
+                            match pid {
+                                Some(pid) => format!("up (pid {})", pid),
+                                None => "up".to_string(),
+                            },
+                        ));
+                        continue;
+                    }
+                    if service.status == ServiceStatus::Stopped {
+                        let _ = p.reply.send(Response::new(
+                            OutcomeKind::Failed,
+                            "exited before it came up — check `devc logs`",
+                        ));
+                        continue;
+                    }
+                }
+                Goal::Down => {
+                    if service.status == ServiceStatus::Stopped {
+                        let _ = p.reply.send(Response::new(OutcomeKind::Changed, "stopped"));
+                        continue;
+                    }
+                }
+                Goal::DownThenUp { wait } => {
+                    if service.status == ServiceStatus::Stopped {
+                        let result = self.services.start(idx, &self.project_root);
+                        if wait && result.outcome == Outcome::Changed {
+                            p.goal = Goal::Up;
+                        } else {
+                            let _ = p.reply.send(from_action(&result));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if now >= p.deadline {
+                let _ = p.reply.send(Response::new(
+                    OutcomeKind::Failed,
+                    format!("timed out waiting for '{}'", p.name),
+                ));
+                continue;
+            }
+            still_pending.push(p);
+        }
+
+        self.pending = still_pending;
+    }
+
+    // --- Snapshot ---
+
+    /// Rebuild `self.snapshot`, bumping `version` only when the view actually
+    /// moved. Subscribers key off `version`, so an idle devc pushes nothing —
+    /// but a spinner mid-animation counts as movement, otherwise an attached
+    /// client would show a frozen spinner while a service starts.
+    pub fn refresh_snapshot(&mut self) {
+        let mut next = self.build_snapshot();
+
+        // Compare with tick and version neutralised: everything else is real
+        // state, and this way no caller has to remember to bump a counter.
+        next.version = self.snapshot.version;
+        next.tick = self.snapshot.tick;
+        let changed = next != self.snapshot || self.is_animating();
+
+        next.tick = self.tick;
+        if changed {
+            next.version = self.snapshot.version.wrapping_add(1);
+        }
+        self.snapshot = next;
+    }
+
+    fn is_animating(&self) -> bool {
+        self.services.items().iter().any(|s| {
+            matches!(s.status, ServiceStatus::Starting | ServiceStatus::Stopping)
+        }) || self
+            .commands
+            .items()
+            .iter()
+            .any(|c| c.status == CommandStatus::Running)
+    }
+
+    fn build_snapshot(&self) -> proto::Snapshot {
+        let services: Vec<proto::ServiceRow> = self
+            .services
+            .items()
+            .iter()
+            .map(|s| proto::ServiceRow {
+                name: s.config.name.clone(),
+                key: s.config.key_char(),
+                status: match s.status {
+                    ServiceStatus::Stopped => proto::StatusKind::Stopped,
+                    ServiceStatus::Starting => proto::StatusKind::Starting,
+                    ServiceStatus::Running => proto::StatusKind::Running,
+                    ServiceStatus::Stopping => proto::StatusKind::Stopping,
+                },
+                owner: match s.owner {
+                    Owner::None => proto::OwnerKind::None,
+                    Owner::Devc => proto::OwnerKind::Devc,
+                    Owner::External { .. } => proto::OwnerKind::External,
+                },
+                pid: s.pid(),
+                port: s.config.port,
+                port_active: s.port_active,
+                url: s.config.open_url(),
+                dirty: s.config_dirty,
+                orphan: s.orphan,
+            })
+            .collect();
+
+        let commands: Vec<proto::CommandRow> = self
+            .commands
+            .items()
+            .iter()
+            .map(|c| proto::CommandRow {
+                name: c.config.name.clone(),
+                key: c.config.key_char(),
+                status: match c.status {
+                    CommandStatus::Idle => proto::CommandStatusKind::Idle,
+                    CommandStatus::Running => proto::CommandStatusKind::Running,
+                    CommandStatus::Done => proto::CommandStatusKind::Done,
+                    CommandStatus::Failed => proto::CommandStatusKind::Failed,
+                },
+                exit_code: c.exit_code,
+                dirty: c.config_dirty,
+                orphan: c.orphan,
+            })
+            .collect();
+
+        let tools: Vec<proto::ToolRow> = self
+            .tools
+            .items()
+            .iter()
+            .map(|t| proto::ToolRow {
+                name: t.name.clone(),
+                key: t.key,
+                kind: match &t.kind {
+                    ToolKind::Link(url) => proto::ToolRowKind::Link { url: url.clone() },
+                    ToolKind::Copy(text) => proto::ToolRowKind::Copy { text: text.clone() },
+                },
+            })
+            .collect();
+
+        // Only the selected entries' logs travel — that's all the log panes
+        // ever render, and shipping every buffer each frame would be waste.
+        let service_selected = self.services.selected_idx();
+        let service_logs = self
+            .services
+            .items()
+            .get(service_selected)
+            .map(|s| s.logs.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let command_selected = self.commands.selected_idx();
+        let command_logs = self
+            .commands
+            .items()
+            .get(command_selected)
+            .map(|c| c.logs.iter().cloned().collect())
+            .unwrap_or_default();
+
+        proto::Snapshot {
+            version: self.snapshot.version,
+            tick: self.tick,
+            tab: match self.tab {
+                Tab::Services => proto::TabKind::Services,
+                Tab::Commands => proto::TabKind::Commands,
+                Tab::Tools => proto::TabKind::Tools,
+            },
+            status_msg: self.status.current().map(|s| s.to_string()),
+            conflicts: self.conflicts.clone(),
+            services,
+            service_selected,
+            service_logs,
+            service_log_scroll: self.services.log_scroll_offset,
+            commands,
+            command_selected,
+            command_logs,
+            command_log_scroll: self.commands.log_scroll_offset,
+            tools,
+            tool_selected: self.tools.selected_idx(),
+        }
     }
 
     pub fn check_config_reload(&mut self) {
@@ -285,6 +774,43 @@ impl App {
 
         report
     }
+}
+
+// --- Control helpers ---
+
+fn from_action(result: &crate::services::ActionResult) -> proto::Response {
+    proto::Response::new(
+        match result.outcome {
+            Outcome::Changed => proto::OutcomeKind::Changed,
+            Outcome::NoOp => proto::OutcomeKind::NoOp,
+            Outcome::Refused => proto::OutcomeKind::Refused,
+            Outcome::NotFound => proto::OutcomeKind::NotFound,
+            Outcome::Failed => proto::OutcomeKind::Failed,
+        },
+        result.reason.clone(),
+    )
+}
+
+/// Name the services that *do* exist — a typo'd name is the most likely reason
+/// an agent lands here, and listing them saves a round trip.
+fn unknown_service(services: &ServicesPane, name: &str) -> proto::Response {
+    let names: Vec<&str> = services
+        .items()
+        .iter()
+        .map(|s| s.config.name.as_str())
+        .collect();
+    proto::Response::not_found(format!(
+        "no service named '{}' (have: {})",
+        name,
+        if names.is_empty() { "none".to_string() } else { names.join(", ") }
+    ))
+}
+
+fn tail(logs: &std::collections::VecDeque<String>, lines: usize) -> Vec<String> {
+    logs.iter()
+        .skip(logs.len().saturating_sub(lines))
+        .cloned()
+        .collect()
 }
 
 
@@ -1419,5 +1945,240 @@ mod planned_api_tests {
         app.services.compact_stopped_orphans();
         app.commands.compact_stopped_orphans();
         assert_eq!(app.commands.len(), 1);
+    }
+
+    // ===== Control socket, end to end =====
+
+    /// Drive a real App through a real socket, the way the CLI does.
+    mod control_e2e {
+        use super::*;
+        use crate::control::{Bind, ControlServer};
+        use crate::protocol::{Op, OutcomeKind, Request, Response};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+
+        fn svc(name: &str, key: &str, port: Option<u16>) -> ServiceConfig {
+            ServiceConfig {
+                name: name.to_string(),
+                key: key.to_string(),
+                command: format!("echo {}", name),
+                working_dir: "./".to_string(),
+                port,
+                url: None,
+                depends_on: vec![],
+            }
+        }
+
+        fn app_with(services: Vec<ServiceConfig>) -> App {
+            App::new(
+                Config {
+                    general: General { project_root: "./".to_string() },
+                    services,
+                    commands: vec![],
+                    links: vec![],
+                    copies: vec![],
+                },
+                PathBuf::from("/tmp"),
+                PathBuf::from("/tmp/devc.toml"),
+                None,
+            )
+        }
+
+        struct Harness {
+            app: App,
+            socket: PathBuf,
+        }
+
+        fn harness(tag: &str, services: Vec<ServiceConfig>) -> Harness {
+            let dir = std::env::temp_dir()
+                .join(format!("devc-app-t{}-{}", std::process::id(), tag));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cfg = PathBuf::from(format!("/tmp/app-{}/devc.toml", tag));
+
+            let mut app = app_with(services);
+            let server = match ControlServer::bind_in(&dir, &cfg).unwrap() {
+                Bind::Bound(s) => s,
+                Bind::AlreadyRunning { .. } => panic!("expected to bind"),
+            };
+            app.attach_control(server);
+            Harness { app, socket: crate::protocol::socket_path_in(&dir, &cfg) }
+        }
+
+        struct Client {
+            stream: UnixStream,
+            reader: BufReader<UnixStream>,
+        }
+
+        impl Client {
+            fn connect(socket: &Path) -> Self {
+                let stream = UnixStream::connect(socket).unwrap();
+                let reader = BufReader::new(stream.try_clone().unwrap());
+                Self { stream, reader }
+            }
+            fn send(&mut self, op: Op) {
+                let mut line = serde_json::to_string(&Request::new(op)).unwrap();
+                line.push('\n');
+                self.stream.write_all(line.as_bytes()).unwrap();
+                self.stream.flush().unwrap();
+            }
+        }
+
+        /// Tick the app until the client has a reply, the way the event loop
+        /// would. Returns the response.
+        fn pump(app: &mut App, client: &mut Client) -> Response {
+            let done = Instant::now() + Duration::from_secs(5);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let mut buf = String::new();
+                    client.reader.read_line(&mut buf).unwrap();
+                    tx.send(buf).unwrap();
+                });
+                loop {
+                    app.poll();
+                    if let Ok(buf) = rx.try_recv() {
+                        return serde_json::from_str(&buf).unwrap();
+                    }
+                    assert!(Instant::now() < done, "no reply from the app");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        }
+
+        #[test]
+        fn starting_twice_over_the_socket_spawns_only_one_process() {
+            let mut h = harness(
+                "idempotent",
+                vec![ServiceConfig { command: "sleep 5".into(), ..svc("Web", "w", None) }],
+            );
+            let mut client = Client::connect(&h.socket);
+
+            client.send(Op::Start { name: "Web".into(), wait: false, timeout_ms: 5_000 });
+            let first = pump(&mut h.app, &mut client);
+            assert_eq!(first.outcome, OutcomeKind::Changed, "{}", first.reason);
+
+            client.send(Op::Start { name: "Web".into(), wait: false, timeout_ms: 5_000 });
+            let second = pump(&mut h.app, &mut client);
+            assert_eq!(
+                second.outcome,
+                OutcomeKind::NoOp,
+                "a repeat start must not spawn a second copy: {}",
+                second.reason
+            );
+            assert!(second.reason.contains("already running"));
+
+            h.app.cleanup();
+        }
+
+        #[test]
+        fn an_unknown_name_lists_what_does_exist() {
+            let mut h = harness("unknown", vec![svc("Web", "w", None)]);
+            let mut client = Client::connect(&h.socket);
+
+            client.send(Op::Start { name: "Nope".into(), wait: false, timeout_ms: 1_000 });
+            let resp = pump(&mut h.app, &mut client);
+            assert_eq!(resp.outcome, OutcomeKind::NotFound);
+            assert!(resp.reason.contains("Web"), "got: {}", resp.reason);
+        }
+
+        #[test]
+        fn status_reports_the_state_the_ui_is_showing() {
+            let mut h = harness("status", vec![svc("Web", "w", Some(4321))]);
+            let mut client = Client::connect(&h.socket);
+
+            client.send(Op::Status);
+            let resp = pump(&mut h.app, &mut client);
+            let snap = resp.snapshot.expect("status carries a snapshot");
+
+            // The service rows are the shared substance; tick and the transient
+            // status flash move on their own between ticks.
+            assert_eq!(
+                snap.services, h.app.snapshot.services,
+                "status must report the same rows the TUI renders"
+            );
+            assert_eq!(snap.services[0].name, "Web");
+            assert_eq!(snap.services[0].port, Some(4321));
+            assert_eq!(snap.services[0].url.as_deref(), Some("http://localhost:4321/"));
+        }
+
+        #[test]
+        fn an_attached_client_sees_the_view_and_can_drive_it() {
+            let mut h = harness("attach", vec![svc("Web", "w", None)]);
+            let mut client = Client::connect(&h.socket);
+
+            // Subscribing yields the current view immediately.
+            client.send(Op::Subscribe);
+            let first = pump(&mut h.app, &mut client);
+            let snap = first.snapshot.expect("subscribe sends an initial snapshot");
+            assert_eq!(snap.tab, proto::TabKind::Services);
+
+            // A forwarded keystroke drives the primary, and the change comes
+            // back on the subscription.
+            client.send(Op::Key { key: proto::RemoteKey::Tab });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                h.app.poll();
+                if h.app.snapshot.tab == proto::TabKind::Commands {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "key never reached the primary");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn a_port_held_from_outside_is_detected_and_protected() {
+            // A real listener devc knows nothing about — the stand-in for a
+            // server an agent started in a shell and forgot.
+            let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = squatter.local_addr().unwrap().port();
+
+            let mut h = harness("external", vec![svc("Web", "w", Some(port))]);
+
+            // Let the port monitor notice, the same way the running TUI would.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                h.app.poll();
+                if matches!(h.app.services[0].owner, Owner::External { .. }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "external listener was never detected");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let mut client = Client::connect(&h.socket);
+
+            // Starting is a no-op: what the caller wanted is already true.
+            client.send(Op::Start { name: "Web".into(), wait: false, timeout_ms: 1_000 });
+            let start = pump(&mut h.app, &mut client);
+            assert_eq!(start.outcome, OutcomeKind::NoOp, "{}", start.reason);
+            assert_eq!(start.outcome.exit_code(), 0);
+            assert!(h.app.services[0].process.is_none(), "must not have spawned a duplicate");
+
+            // Stopping is refused: devc didn't start it and won't kill it.
+            client.send(Op::Stop { name: "Web".into(), wait: false, timeout_ms: 1_000 });
+            let stop = pump(&mut h.app, &mut client);
+            assert_eq!(stop.outcome, OutcomeKind::Refused, "{}", stop.reason);
+            assert_eq!(stop.outcome.exit_code(), 4);
+
+            drop(squatter);
+        }
+
+        #[test]
+        fn waiting_on_a_service_that_dies_reports_failure_rather_than_hanging() {
+            let mut h = harness(
+                "wait-fail",
+                // Exits immediately, so "wait until up" can never be satisfied.
+                vec![ServiceConfig { command: "true".into(), ..svc("Web", "w", None) }],
+            );
+            let mut client = Client::connect(&h.socket);
+
+            client.send(Op::Start { name: "Web".into(), wait: true, timeout_ms: 3_000 });
+            let resp = pump(&mut h.app, &mut client);
+            assert_eq!(resp.outcome, OutcomeKind::Failed, "{}", resp.reason);
+            assert!(resp.reason.contains("exited"), "got: {}", resp.reason);
+        }
     }
 }

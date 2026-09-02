@@ -49,6 +49,12 @@ impl ProcessHandle {
         Ok(Self { child, pid })
     }
 
+    /// PID of the shell devc spawned — also the process-group id, since
+    /// `spawn` calls `process_group(0)`.
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
     pub fn send_sigterm(&self) {
         unsafe {
             libc::killpg(self.pid, libc::SIGTERM);

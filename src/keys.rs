@@ -115,7 +115,7 @@ mod tests {
                 port: None, url: None, depends_on: vec![],
             },
             process: None, status: crate::services::ServiceStatus::Stopped,
-            port_active: false, stopping_since: None,
+            port_active: false, owner: crate::services::Owner::None, stopping_since: None,
             logs: VecDeque::new(), config_dirty: false, orphan: false,
         };
         let cmd_space = CommandState {
@@ -124,7 +124,7 @@ mod tests {
                 name: "Build".into(), key: " ".into(),
                 command: "true".into(), working_dir: ".".into(),
             },
-            process: None, status: CommandStatus::Idle,
+            process: None, status: CommandStatus::Idle, exit_code: None,
             logs: VecDeque::new(), config_dirty: false, orphan: false,
         };
 

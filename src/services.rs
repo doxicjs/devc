@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::app::LogSource;
 use crate::config::ServiceConfig;
 use crate::id::ServiceId;
+use crate::port_monitor::{probe_port, PortResult, PortTarget};
 use crate::process::ProcessHandle;
 
 pub const LOG_CAPACITY: usize = 500;
@@ -24,16 +25,78 @@ pub enum ServiceStatus {
     Stopping,
 }
 
+/// Who is actually holding this service up. The whole point of the
+/// single-instance work: "not running" and "running, but not by us" are
+/// different answers, and only the first one means "safe to start".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// No devc process and no port activity — genuinely down.
+    None,
+    /// devc spawned it and holds the handle.
+    Devc,
+    /// The port answers but devc has no process for it. Someone started this
+    /// outside devc (a stray `pnpm dev` in a shell, a leftover container).
+    /// `pid` is resolved lazily by the port monitor via lsof.
+    External { pid: Option<i32> },
+}
+
+/// What a `start`/`stop` request actually did. Maps onto CLI exit codes:
+/// NoOp is a *success* — the caller asked for a state that already holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Changed,
+    NoOp,
+    Refused,
+    NotFound,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActionResult {
+    pub outcome: Outcome,
+    pub reason: String,
+}
+
+impl ActionResult {
+    fn changed(reason: impl Into<String>) -> Self {
+        Self { outcome: Outcome::Changed, reason: reason.into() }
+    }
+    fn noop(reason: impl Into<String>) -> Self {
+        Self { outcome: Outcome::NoOp, reason: reason.into() }
+    }
+    fn refused(reason: impl Into<String>) -> Self {
+        Self { outcome: Outcome::Refused, reason: reason.into() }
+    }
+    fn not_found(reason: impl Into<String>) -> Self {
+        Self { outcome: Outcome::NotFound, reason: reason.into() }
+    }
+    fn failed(reason: impl Into<String>) -> Self {
+        Self { outcome: Outcome::Failed, reason: reason.into() }
+    }
+}
+
 pub struct ServiceState {
     pub id: ServiceId,
     pub config: ServiceConfig,
     pub process: Option<ProcessHandle>,
     pub status: ServiceStatus,
     pub port_active: bool,
+    pub owner: Owner,
     pub stopping_since: Option<Instant>,
     pub logs: VecDeque<String>,
     pub config_dirty: bool,
     pub orphan: bool,
+}
+
+impl ServiceState {
+    /// PID of whatever is holding this service up, devc-owned or not.
+    pub fn pid(&self) -> Option<i32> {
+        match self.owner {
+            Owner::Devc => self.process.as_ref().map(|p| p.pid()),
+            Owner::External { pid } => pid,
+            Owner::None => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -67,6 +130,7 @@ impl ServicesPane {
                     process: None,
                     status: ServiceStatus::Stopped,
                     port_active: false,
+                    owner: Owner::None,
                     stopping_since: None,
                     logs: VecDeque::with_capacity(LOG_CAPACITY),
                     config_dirty: false,
@@ -84,34 +148,94 @@ impl ServicesPane {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool { self.items.is_empty() }
 
+    #[allow(dead_code)] // the TUI counts from the snapshot; kept for tests
     pub fn running_count(&self) -> usize {
         self.items.iter().filter(|s| s.status == ServiceStatus::Running).count()
     }
 
-    pub fn toggle(&mut self, idx: usize, project_root: &Path) {
-        if idx >= self.items.len() {
-            return;
-        }
+    pub fn find_by_name(&self, name: &str) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|s| s.config.name.eq_ignore_ascii_case(name))
+    }
 
-        let status = self.items[idx].status;
+    /// Bring a service up, idempotently. Starting something already up is a
+    /// no-op that says so — that's what lets an agent call `devc start Web`
+    /// without first having to remember whether it already did.
+    pub fn start(&mut self, idx: usize, project_root: &Path) -> ActionResult {
+        let Some(service) = self.items.get(idx) else {
+            return ActionResult::not_found("no service at index");
+        };
 
-        // Ignore if in transitional state
-        if status == ServiceStatus::Starting || status == ServiceStatus::Stopping {
-            return;
-        }
-
-        if status == ServiceStatus::Running {
-            // Stop: send SIGTERM and enter Stopping state (non-blocking)
-            let service = &mut self.items[idx];
-            if let Some(ref proc) = service.process {
-                proc.send_sigterm();
+        match service.status {
+            ServiceStatus::Running | ServiceStatus::Starting => {
+                let pid = service.process.as_ref().map(|p| p.pid());
+                return ActionResult::noop(match pid {
+                    Some(p) => format!("already running (pid {})", p),
+                    None => "already running".to_string(),
+                });
             }
-            service.status = ServiceStatus::Stopping;
-            service.stopping_since = Some(Instant::now());
-            service.logs.push_back("── stopping ──".to_string());
-        } else {
-            let mut visited = Vec::<usize>::new();
-            self.start_with_deps(idx, project_root, &mut visited);
+            ServiceStatus::Stopping => {
+                return ActionResult::refused("service is stopping — retry once it's down");
+            }
+            ServiceStatus::Stopped => {}
+        }
+
+        if let Owner::External { pid } = service.owner {
+            // Something outside devc is already serving this port. The caller
+            // wanted the service up and it is up, so this is a success, not an
+            // error — but we must not spawn a second one.
+            let reason = external_reason(service, pid);
+            self.items[idx].logs.push_back(format!("── {} ──", reason));
+            return ActionResult::noop(reason);
+        }
+
+        let mut visited = Vec::<usize>::new();
+        self.start_with_deps(idx, project_root, &mut visited)
+    }
+
+    /// Take a service down. Refuses to touch processes devc didn't spawn.
+    pub fn stop(&mut self, idx: usize) -> ActionResult {
+        let Some(service) = self.items.get_mut(idx) else {
+            return ActionResult::not_found("no service at index");
+        };
+
+        if let Owner::External { pid } = service.owner {
+            return ActionResult::refused(format!(
+                "{} — devc didn't start it, so it won't stop it",
+                external_reason(service, pid)
+            ));
+        }
+
+        match service.status {
+            ServiceStatus::Stopped => ActionResult::noop("already stopped"),
+            ServiceStatus::Stopping => ActionResult::noop("already stopping"),
+            ServiceStatus::Running | ServiceStatus::Starting => {
+                if let Some(ref proc) = service.process {
+                    proc.send_sigterm();
+                }
+                service.status = ServiceStatus::Stopping;
+                service.stopping_since = Some(Instant::now());
+                service.logs.push_back("── stopping ──".to_string());
+                ActionResult::changed("stopping")
+            }
+        }
+    }
+
+    pub fn toggle(&mut self, idx: usize, project_root: &Path) {
+        let Some(service) = self.items.get(idx) else { return };
+
+        // Transitional states are still ignored on the keyboard path: a
+        // half-pressed toggle during startup/shutdown is almost always a
+        // mistake. The control API is explicit, so it doesn't need this guard.
+        match service.status {
+            ServiceStatus::Starting | ServiceStatus::Stopping => {}
+            ServiceStatus::Running => {
+                self.stop(idx);
+            }
+            ServiceStatus::Stopped => {
+                self.start(idx, project_root);
+            }
         }
     }
 
@@ -123,7 +247,7 @@ impl ServicesPane {
     pub fn stop_all(&mut self) {
         for i in 0..self.items.len() {
             if self.items[i].status == ServiceStatus::Running {
-                self.toggle(i, Path::new("."));
+                self.stop(i);
             }
         }
     }
@@ -148,18 +272,38 @@ impl ServicesPane {
         }
     }
 
-    pub fn port_targets(&self) -> Vec<(ServiceId, u16)> {
+    pub fn port_targets(&self) -> Vec<PortTarget> {
         self.items
             .iter()
-            .filter_map(|s| s.config.port.map(|p| (s.id, p)))
+            .filter_map(|s| {
+                s.config.port.map(|port| PortTarget {
+                    id: s.id,
+                    port,
+                    // Only pay for lsof when a live port can't be ours.
+                    resolve_pid: s.process.is_none(),
+                })
+            })
             .collect()
     }
 
-    pub fn apply_ports(&mut self, results: &[(ServiceId, bool)]) {
-        for (id, active) in results {
-            if let Some(s) = self.items.iter_mut().find(|s| s.id == *id) {
-                s.port_active = *active;
+    pub fn apply_ports(&mut self, results: &[PortResult]) {
+        for r in results {
+            let Some(s) = self.items.iter_mut().find(|s| s.id == r.id) else { continue };
+            s.port_active = r.active;
+            if s.process.is_some() {
+                continue; // ownership is settled by check_processes
             }
+            s.owner = if r.active {
+                // Keep a previously resolved pid if this round's lsof came up
+                // empty, so the label doesn't flicker between probes.
+                let pid = r.pid.or(match s.owner {
+                    Owner::External { pid } => pid,
+                    _ => None,
+                });
+                Owner::External { pid }
+            } else {
+                Owner::None
+            };
         }
     }
 
@@ -183,9 +327,11 @@ impl ServicesPane {
                     if let Some(proc) = &mut service.process {
                         if proc.is_running() {
                             service.status = ServiceStatus::Running;
+                            service.owner = Owner::Devc;
                         } else {
                             service.process = None;
                             service.status = ServiceStatus::Stopped;
+                            service.owner = Owner::None;
                             service.logs.push_back("── process exited ──".to_string());
                         }
                     }
@@ -195,6 +341,7 @@ impl ServicesPane {
                         if !proc.is_running() {
                             service.process = None;
                             service.status = ServiceStatus::Stopped;
+                            service.owner = Owner::None;
                             service.logs.push_back("── process exited ──".to_string());
                         }
                     }
@@ -204,6 +351,7 @@ impl ServicesPane {
                         if !proc.is_running() {
                             service.process = None;
                             service.status = ServiceStatus::Stopped;
+                            service.owner = Owner::None;
                             service.stopping_since = None;
                             service.logs.push_back("── stopped ──".to_string());
                         } else if let Some(since) = service.stopping_since {
@@ -260,6 +408,7 @@ impl ServicesPane {
                     process: None,
                     status: ServiceStatus::Stopped,
                     port_active: false,
+                    owner: Owner::None,
                     stopping_since: None,
                     logs: VecDeque::with_capacity(LOG_CAPACITY),
                     config_dirty: false,
@@ -329,36 +478,52 @@ impl ServicesPane {
 
     // --- Private helpers ---
 
-    fn start_with_deps(&mut self, idx: usize, project_root: &Path, visited: &mut Vec<usize>) {
+    fn start_with_deps(
+        &mut self,
+        idx: usize,
+        project_root: &Path,
+        visited: &mut Vec<usize>,
+    ) -> ActionResult {
         if visited.contains(&idx) {
-            return; // cycle detected
+            return ActionResult::refused("dependency cycle");
         }
         visited.push(idx);
 
         let deps: Vec<String> = self.items[idx].config.depends_on.clone();
         for dep_name in &deps {
             if let Some(dep_idx) = self.items.iter().position(|s| s.config.name == *dep_name) {
-                if self.items[dep_idx].status == ServiceStatus::Stopped {
+                if self.items[dep_idx].status == ServiceStatus::Stopped
+                    && !matches!(self.items[dep_idx].owner, Owner::External { .. })
+                {
                     self.start_with_deps(dep_idx, project_root, visited);
                 }
             }
         }
-        self.start_service(idx, project_root);
+        self.start_service(idx, project_root)
     }
 
-    fn start_service(&mut self, idx: usize, project_root: &Path) {
-        let service = &mut self.items[idx];
-
-        if service.port_active {
-            if let Some(port) = service.config.port {
-                service.logs.push_back(format!(
-                    "── port {} already in use ──",
-                    port
-                ));
+    fn start_service(&mut self, idx: usize, project_root: &Path) -> ActionResult {
+        // Probe the port *now* rather than trusting `port_active`, which the
+        // monitor only refreshes every couple of seconds. That stale window is
+        // precisely where a second copy of a server gets spawned.
+        if let Some(port) = self.items[idx].config.port {
+            if probe_port(port) {
+                let service = &mut self.items[idx];
+                service.port_active = true;
+                let pid = service.pid();
+                if service.owner == Owner::None {
+                    service.owner = Owner::External { pid: None };
+                }
+                let reason = match pid {
+                    Some(p) => format!("port {} already held by pid {}", port, p),
+                    None => format!("port {} already in use", port),
+                };
+                service.logs.push_back(format!("── {} ──", reason));
+                return ActionResult::noop(reason);
             }
-            return;
         }
 
+        let service = &mut self.items[idx];
         service.status = ServiceStatus::Starting;
         service.config_dirty = false;
 
@@ -374,13 +539,32 @@ impl ServicesPane {
             move || LogSource::Service(service_id),
         ) {
             Ok(handle) => {
+                let pid = handle.pid();
                 self.items[idx].process = Some(handle);
+                self.items[idx].owner = Owner::Devc;
+                ActionResult::changed(format!("started (pid {})", pid))
             }
             Err(e) => {
                 self.items[idx].logs.push_back(format!("error: {}", e));
                 self.items[idx].status = ServiceStatus::Stopped;
+                self.items[idx].owner = Owner::None;
+                ActionResult::failed(format!("spawn failed: {}", e))
             }
         }
+    }
+}
+
+/// Human-readable "someone else has this" message, shared by start and stop so
+/// the two never drift.
+fn external_reason(service: &ServiceState, pid: Option<i32>) -> String {
+    let port = service
+        .config
+        .port
+        .map(|p| format!("port {}", p))
+        .unwrap_or_else(|| "the port".to_string());
+    match pid {
+        Some(p) => format!("{} held by external pid {}", port, p),
+        None => format!("{} held by an external process", port),
     }
 }
 
@@ -439,6 +623,112 @@ mod tests {
     }
 
     #[test]
+    fn start_on_a_running_service_is_an_idempotent_noop() {
+        let mut p = ServicesPane::from_config(vec![ServiceConfig {
+            command: "sleep 5".into(),
+            ..svc_cfg("a", "a", None)
+        }]);
+
+        let first = p.start(0, Path::new("."));
+        assert_eq!(first.outcome, Outcome::Changed, "{}", first.reason);
+
+        let second = p.start(0, Path::new("."));
+        assert_eq!(
+            second.outcome,
+            Outcome::NoOp,
+            "second start must not spawn a duplicate: {}",
+            second.reason
+        );
+        assert!(second.reason.contains("already running"));
+
+        p.cleanup();
+    }
+
+    #[test]
+    fn start_refuses_to_duplicate_a_port_held_by_someone_else() {
+        // Stand in for "an agent already ran `pnpm dev` in a shell".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut p = ServicesPane::from_config(vec![ServiceConfig {
+            command: "sleep 5".into(),
+            ..svc_cfg("a", "a", Some(port))
+        }]);
+
+        // port_active is still false — the monitor hasn't run. The synchronous
+        // pre-spawn probe is what has to catch this.
+        assert!(!p.items()[0].port_active);
+
+        let r = p.start(0, Path::new("."));
+        assert_eq!(r.outcome, Outcome::NoOp, "{}", r.reason);
+        assert!(r.reason.contains("already"), "got: {}", r.reason);
+        assert!(p.items()[0].process.is_none(), "must not have spawned anything");
+        assert_eq!(p.items()[0].status, ServiceStatus::Stopped);
+    }
+
+    #[test]
+    fn stop_refuses_a_process_devc_did_not_start() {
+        let mut p = ServicesPane::from_config(vec![svc_cfg("a", "a", Some(3000))]);
+        p[0].owner = Owner::External { pid: Some(4242) };
+        p[0].port_active = true;
+
+        let r = p.stop(0);
+        assert_eq!(r.outcome, Outcome::Refused);
+        assert!(r.reason.contains("4242"), "got: {}", r.reason);
+    }
+
+    #[test]
+    fn stop_on_a_stopped_service_is_a_noop() {
+        let mut p = ServicesPane::from_config(vec![svc_cfg("a", "a", None)]);
+        assert_eq!(p.stop(0).outcome, Outcome::NoOp);
+    }
+
+    #[test]
+    fn actions_on_unknown_index_report_not_found() {
+        let mut p = ServicesPane::from_config(vec![svc_cfg("a", "a", None)]);
+        assert_eq!(p.start(9, Path::new(".")).outcome, Outcome::NotFound);
+        assert_eq!(p.stop(9).outcome, Outcome::NotFound);
+    }
+
+    #[test]
+    fn apply_ports_marks_unowned_live_ports_as_external() {
+        let mut p = ServicesPane::from_config(vec![svc_cfg("a", "a", Some(3000))]);
+        let id = p.items()[0].id;
+
+        p.apply_ports(&[PortResult { id, active: true, pid: Some(99) }]);
+        assert_eq!(p.items()[0].owner, Owner::External { pid: Some(99) });
+
+        // A round where lsof came up empty keeps the last known pid.
+        p.apply_ports(&[PortResult { id, active: true, pid: None }]);
+        assert_eq!(p.items()[0].owner, Owner::External { pid: Some(99) });
+
+        p.apply_ports(&[PortResult { id, active: false, pid: None }]);
+        assert_eq!(p.items()[0].owner, Owner::None);
+    }
+
+    #[test]
+    fn port_targets_request_pid_only_for_unowned_services() {
+        let mut p = ServicesPane::from_config(vec![ServiceConfig {
+            command: "sleep 5".into(),
+            ..svc_cfg("a", "a", Some(3000))
+        }]);
+        assert!(p.port_targets()[0].resolve_pid, "no process yet — ask who's there");
+
+        p.start(0, Path::new("."));
+        assert!(!p.port_targets()[0].resolve_pid, "we own it — skip the lsof");
+
+        p.cleanup();
+    }
+
+    #[test]
+    fn find_by_name_is_case_insensitive() {
+        let p = ServicesPane::from_config(vec![svc_cfg("Web", "w", None)]);
+        assert_eq!(p.find_by_name("web"), Some(0));
+        assert_eq!(p.find_by_name("WEB"), Some(0));
+        assert_eq!(p.find_by_name("api"), None);
+    }
+
+    #[test]
     fn port_targets_includes_only_configured_ports() {
         let p = ServicesPane::from_config(vec![
             svc_cfg("a", "a", None),
@@ -446,6 +736,6 @@ mod tests {
         ]);
         let targets = p.port_targets();
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].1, 3000);
+        assert_eq!(targets[0].port, 3000);
     }
 }
