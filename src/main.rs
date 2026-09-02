@@ -144,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut app = App::new(config, config_dir, config_path, local_path);
+    let socket_paths = server.paths();
     app.attach_control(server);
 
     // Handle SIGINT/SIGTERM so cleanup() runs before exit.
@@ -162,17 +163,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         action.sa_flags = 0;
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
-        // Closing the terminal is a normal way for a TUI to end. Without this,
-        // devc dies on the spot — leaving its services orphaned and its control
-        // socket behind for the next run to clean up.
+        // Handling SIGHUP is only safe because of the watchdog below.
+        //
+        // SIGHUP's default disposition is to terminate. Replacing that with a
+        // handler that merely sets a flag is a trap: when the terminal closes,
+        // `crossterm::event::poll` spins on EOF reads and never returns, so the
+        // main loop never reaches its `running` check and nothing ever reads
+        // the flag. 0.3.0 shipped exactly that — devc outlived its terminal at
+        // ~95% CPU. The watchdog is what makes termination guaranteed again.
         libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
     }
+
+    spawn_shutdown_watchdog(&RUNNING, socket_paths);
 
     let result = {
         let _guard = RawTerminal::enter()?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         let r = run(&mut terminal, &mut app, &RUNNING);
+        // The loop returned, so this thread is healthy and owns the shutdown.
+        // Telling the watchdog stops it force-exiting midway through a cleanup
+        // that legitimately takes seconds (each service gets a 3s grace).
+        SHUTDOWN_STARTED.store(true, Ordering::SeqCst);
         app.cleanup();
         r
         // _guard drops here — raw mode, alt-screen, and mouse capture are
@@ -187,6 +199,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     result
+}
+
+/// Set once the event loop has returned and the main thread has taken
+/// responsibility for shutting down.
+static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Guarantees devc actually dies when it's asked to.
+///
+/// The main thread normally handles its own shutdown, and that path is better:
+/// it stops services with their full per-service grace period and drops the
+/// control server cleanly. But it can be unreachable — when the terminal goes
+/// away, `crossterm::event::poll` spins on EOF reads and never returns, so the
+/// loop never sees the flag the signal handler set.
+///
+/// So: after a shutdown signal, give the loop a moment to *begin* shutting
+/// down. If it does, stand down and let it finish however long that takes.
+/// If it never even starts, it's wedged — put the children down, remove the
+/// socket, and exit.
+fn spawn_shutdown_watchdog(running: &'static AtomicBool, cleanup_paths: [PathBuf; 2]) {
+    // Long enough to rule out ordinary scheduling delay, short enough that a
+    // runaway process isn't left burning a core.
+    const GRACE: Duration = Duration::from_secs(2);
+    const TICK: Duration = Duration::from_millis(50);
+
+    std::thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            if SHUTDOWN_STARTED.load(Ordering::SeqCst) {
+                return; // quit via `q` — the main thread has it
+            }
+            std::thread::sleep(TICK);
+        }
+
+        let deadline = std::time::Instant::now() + GRACE;
+        while std::time::Instant::now() < deadline {
+            if SHUTDOWN_STARTED.load(Ordering::SeqCst) {
+                return; // the loop woke up and is doing the orderly shutdown
+            }
+            std::thread::sleep(TICK);
+        }
+
+        // Wedged. Nothing on the main thread will run again.
+        process::terminate_all_children();
+        for path in &cleanup_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        // Best-effort: if the terminal is genuinely gone these are no-ops, but
+        // if devc was killed some other way the user gets their shell back.
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        std::process::exit(0);
+    });
 }
 
 pub fn local_config_path(main_path: &std::path::Path) -> Option<PathBuf> {

@@ -1,14 +1,70 @@
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread;
 
 use crate::app::LogSource;
 
+/// Process-group ids of every child devc currently owns.
+///
+/// The event loop normally stops services itself, but it can get wedged in the
+/// terminal library with the pty gone (see the watchdog in `main.rs`), and then
+/// nothing on that thread runs again. This registry is what lets a *different*
+/// thread put the children down. Guarded by a plain mutex — it's only ever
+/// touched from ordinary threads, never from a signal handler.
+static LIVE_PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// SIGTERM every child process group, then SIGKILL whatever is left.
+///
+/// Only for the wedged path: the orderly shutdown in `ServicesPane::cleanup`
+/// gives each service a longer, per-service grace period.
+pub fn terminate_all_children() {
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    let pgids: Vec<i32> = match LIVE_PGIDS.lock() {
+        Ok(guard) => guard.clone(),
+        // A panicking thread shouldn't strand the children.
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if pgids.is_empty() {
+        return;
+    }
+    for pgid in &pgids {
+        unsafe { libc::killpg(*pgid, libc::SIGTERM) };
+    }
+    thread::sleep(GRACE);
+    for pgid in &pgids {
+        unsafe { libc::killpg(*pgid, libc::SIGKILL) };
+    }
+}
+
+fn register_pgid(pid: i32) {
+    if let Ok(mut g) = LIVE_PGIDS.lock() {
+        g.push(pid);
+    }
+}
+
+fn unregister_pgid(pid: i32) {
+    if let Ok(mut g) = LIVE_PGIDS.lock() {
+        g.retain(|p| *p != pid);
+    }
+}
+
+#[cfg(test)]
+fn registered_pgids() -> Vec<i32> {
+    LIVE_PGIDS.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
 pub struct ProcessHandle {
     child: Child,
     pid: i32,
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unregister_pgid(self.pid);
+    }
 }
 
 impl ProcessHandle {
@@ -37,7 +93,10 @@ impl ProcessHandle {
             .process_group(0);
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        // `process_group(0)` makes the child its own group leader, so its pid
+        // doubles as the pgid we signal.
         let pid = child.id() as i32;
+        register_pgid(pid);
 
         if let Some(stdout) = child.stdout.take() {
             spawn_reader(stdout, log_sender.clone(), tag.clone());
@@ -337,6 +396,33 @@ mod tests {
         // If SIGKILL was used, it would be nearly instant after the timeout.
         // We just verify it terminates — the timeout test is implicit.
     }
+
+    // ===== Child registry (what the shutdown watchdog signals) =====
+
+    #[test]
+    fn spawned_children_are_registered_and_deregistered_on_drop() {
+        let (tx, _rx) = mpsc::channel();
+        let mut handle =
+            ProcessHandle::spawn("sleep 30", ".", tx, || LogSource::Service(ServiceId(0))).unwrap();
+        let pid = handle.pid();
+
+        assert!(
+            registered_pgids().contains(&pid),
+            "a live child must be reachable by the watchdog"
+        );
+
+        handle.kill();
+        drop(handle);
+        assert!(
+            !registered_pgids().contains(&pid),
+            "a finished child must not be signalled later"
+        );
+    }
+
+    // NOTE: `terminate_all_children` has no unit test on purpose — it signals
+    // every registered child, so calling it here would race the other tests in
+    // this file that assert on their own live `sleep` processes. Its behaviour
+    // is covered end to end by closing a real pty; see MIGRATION 0.3.0 → 0.3.1.
 
     // ===== Spawn errors =====
 

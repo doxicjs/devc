@@ -96,6 +96,12 @@ impl ControlServer {
         })))
     }
 
+    /// Socket and metadata paths, so the shutdown watchdog can remove them
+    /// without going through `Drop` — which never runs if we have to force-exit.
+    pub fn paths(&self) -> [PathBuf; 2] {
+        [self.socket_path.clone(), self.meta_path.clone()]
+    }
+
     /// Non-blocking: everything that arrived since the last tick.
     pub fn drain_jobs(&mut self) -> Vec<Job> {
         let mut out = Vec::new();

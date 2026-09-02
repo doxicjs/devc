@@ -51,6 +51,7 @@ Services, commands, and tools also have their own shortcut keys defined in `devc
 - **Service URL** — if `url` is not set but `port` is, `Space` opens `http://localhost:<port>/`
 - **Dependencies** — services listed in `depends_on` are started automatically before the dependent service
 - **Stop signal** — services receive `SIGTERM` first, then `SIGKILL` after 3s if still running
+- **Closing the terminal** — devc stops its services and removes its control socket, rather than leaving them orphaned
 - **Log buffer** — last 500 lines of output are kept per service/command
 - **ANSI colors** — log panels render ANSI escape sequences (16 standard colors, 256 indexed, 24-bit RGB, bold, dim, italic, underline, strikethrough, and more)
 - **Status messages** — flash for 3 seconds then disappear
