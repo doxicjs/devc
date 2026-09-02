@@ -269,19 +269,41 @@ fn probe_live(sock: &Path, meta_path: &Path) -> Option<i32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::protocol::Op;
     use std::time::{Duration, Instant};
 
-    /// A private socket directory per test. Tests run in parallel and the
-    /// runtime dir is derived from process-wide env, so each test passes its
-    /// own directory explicitly rather than mutating `XDG_RUNTIME_DIR` — one
-    /// test's env change would otherwise land in another's `bind`.
-    fn scratch(tag: &str) -> PathBuf {
+    /// A private socket directory per test, removed when the test ends. Tests
+    /// run in parallel and the runtime dir is derived from process-wide env, so
+    /// each test passes its own directory explicitly rather than mutating
+    /// `XDG_RUNTIME_DIR` — one test's env change would otherwise land in
+    /// another's `bind`.
+    pub struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub fn scratch(tag: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("devc-t{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
-        dir
+        Scratch(dir)
     }
 
     fn bind_or_panic(dir: &Path, cfg: &Path) -> Box<ControlServer> {
