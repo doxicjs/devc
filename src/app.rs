@@ -1989,12 +1989,11 @@ mod planned_api_tests {
         struct Harness {
             app: App,
             socket: PathBuf,
+            _dir: crate::control::tests::Scratch,
         }
 
         fn harness(tag: &str, services: Vec<ServiceConfig>) -> Harness {
-            let dir = std::env::temp_dir()
-                .join(format!("devc-app-t{}-{}", std::process::id(), tag));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = crate::control::tests::scratch(&format!("app-{}", tag));
             let cfg = PathBuf::from(format!("/tmp/app-{}/devc.toml", tag));
 
             let mut app = app_with(services);
@@ -2003,7 +2002,10 @@ mod planned_api_tests {
                 Bind::AlreadyRunning { .. } => panic!("expected to bind"),
             };
             app.attach_control(server);
-            Harness { app, socket: crate::protocol::socket_path_in(&dir, &cfg) }
+            let socket = crate::protocol::socket_path_in(&dir, &cfg);
+            // `dir` is a guard: holding it in the harness keeps the socket
+            // directory alive for the test and removes it afterwards.
+            Harness { app, socket, _dir: dir }
         }
 
         struct Client {
