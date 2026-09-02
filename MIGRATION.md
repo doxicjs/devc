@@ -1,5 +1,29 @@
 # Migration Guide
 
+## 0.3.0 → 0.3.1
+
+Bug-fix release. No config changes.
+
+### Fixes a 0.3.0 regression: devc outliving its terminal
+
+**If you are on 0.3.0, upgrade.** Closing the terminal running devc left the process alive, spinning at ~95% CPU, with its services orphaned and its control socket stale.
+
+Cause: 0.3.0 installed a `SIGHUP` handler that set a shutdown flag. But once the pty is gone, `crossterm::event::poll` spins on EOF reads and never returns, so the event loop never reached the check — the handler had replaced a guaranteed kernel termination with a flag nothing could read. Releases before 0.3.0 were unaffected because `SIGHUP` still had its default disposition (terminate immediately).
+
+### Closing the terminal now stops your services
+
+The fix is a shutdown watchdog on its own thread, so this is now *better* than pre-0.3.0 behavior rather than merely restored:
+
+| | ≤ 0.2.0 | 0.3.0 | 0.3.1 |
+| --- | --- | --- | --- |
+| devc process | dies | **spins forever at ~95% CPU** | dies |
+| services | orphaned | orphaned | **stopped** |
+| control socket | left stale | left stale | **removed** |
+
+If you relied on services surviving a closed terminal, they no longer do — detach with your terminal multiplexer instead, or leave devc running.
+
+The watchdog only acts when the event loop is genuinely stuck: on a signal it waits briefly for the loop to *begin* shutting down, and stands down if it does, so an orderly shutdown still gets its full per-service grace period.
+
 ## 0.2.0 → 0.3.0
 
 0.3.0 adds a control socket so scripts and agents can query and drive a running devc, and makes devc the single authority on whether a service is up. No config changes are required.
